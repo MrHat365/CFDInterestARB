@@ -35,177 +35,46 @@ _K_DOWN = "#16c784"   # 下阈值 / 买入进场方向
 _EXTREME = "#f0b90b"
 _CROSS = (255, 255, 255, 70)
 
-# 蜡烛笔刷（模块级复用，避免每块重创建）
-_PEN_UP = QtGui.QPen(QtGui.QColor(_K_DOWN), 1)      # 阳线绿
-_PEN_DN = QtGui.QPen(QtGui.QColor(_K_UP), 1)        # 阴线红
-_BRUSH_UP = QtGui.QBrush(QtGui.QColor(22, 199, 132, 120))
-_BRUSH_DN = QtGui.QBrush(QtGui.QColor(234, 57, 67, 120))
 
 _DAY = 86_400.0
 
 
-_H1 = 3600.0   # 蜡烛周期（与价差历史口径一致：H1）
-_PICTURE_STEP = 600   # 蜡烛 QPicture 分块步长；重绘只重放可见块
-_VIEW_BARS = 1200     # 载入后默认显示的最近蜡烛根数（更早历史可拖动/缩放查看）
+_H1 = 3600.0   # （历史遗留默认秒宽；M1=60，实际桶宽由 set_series 从数据自动推导）
 
 
-class _CandlestickItem(pg.GraphicsObject):
-    """组合价差 OHLC 蜡烛绘制件（模式同 vnpy CandleItem，但直接基于数组自绘）。
+def _fixed_ticks(values: list[float], spacing: float) -> list[str]:
+    """定点小数刻度文本（根除科学计数法）。
 
-    阳线（收盘>=开盘）绿 #16c784、阴线红 #ea3943，实体半透。
-    """
-
-    def __init__(self) -> None:
-        super().__init__()
-        self._t: list[float] = []
-        self._o: list[float] = []
-        self._pending_bucket: float | None = None   # 当前未收线蜡烛桶起点
-        self._bar_sec: float = _H1                   # 桶宽（秒）；set_candles 从数据推导
-        self._h: list[float] = []
-        self._l: list[float] = []
-        self._c: list[float] = []
-        self._w = None   # 蜡烛宽度（绘制时按可见范围估算）
-        self._paths: list[tuple[bool, QtGui.QPainterPath, QtGui.QPainterPath]] | None = None
-
-    def set_candles(
-        self, t: list[float], o: list[float], h: list[float],
-        l: list[float], c: list[float],
-    ) -> None:
-        self._t = [float(x) for x in (t or [])]
-        self._o = [float(x) for x in (o or [])]
-        self._h = [float(x) for x in (h or [])]
-        self._l = [float(x) for x in (l or [])]
-        self._c = [float(x) for x in (c or [])]
-        self._pending_bucket = None
-        # 蜡烛桶宽（秒）从数据推导：M1=60、H1=3600 —— 实时聚合/pending/窗口跟随
-        if len(self._t) >= 2 and self._t[1] > self._t[0]:
-            self._bar_sec = float(self._t[1] - self._t[0])
-        self._paths = None   # 全量失效重绘
-        self.update()
-
-    def update_last(self, price: float, ts: float, bucket: float | None = None) -> None:
-        """live tick 聚合：更新最后一根蜡烛（h/l/c），跨入新桶则新增一根；桶宽取数据推导值。"""
-        if not self._t:
-            return
-        if ts < self._t[-1] - 1e-9:
-            return   # 过期 tick（历史还没重载时可能出现）
-        bucket = bucket or self._bar_sec
-        current_open = self._t[-1]
-        if ts >= current_open + bucket:
-            # 新蜡烛：O=H=L=C=price（无盘中细节，仅点级精度）
-            self._t.append(math.floor(ts / bucket) * bucket)
-            self._o.append(price); self._h.append(price)
-            self._l.append(price); self._c.append(price)
-            self._pending_bucket = self._t[-1]
-        else:
-            price = float(price)
-            self._h[-1] = max(self._h[-1], price)
-            self._l[-1] = min(self._l[-1], price)
-            self._c[-1] = price
-            self._pending_bucket = self._t[-1]
-        self._invalidate_last_block()   # 只有最后一根变；其他块缓存留在位
-        self.update()
-
-    def pending_info(self):
-        """未收线的蜡烛 info：（桶起点, 顶部最高值, 本地时间 HH:MM）或 None。"""
-        if not self._t or self._pending_bucket is None:
-            return None
-        i = self._t.index(self._pending_bucket) if self._pending_bucket in self._t else len(self._t) - 1
-        if i >= len(self._t):
-            return None
-        top = max(self._o[i], self._h[i], self._l[i], self._c[i])
-        hhmm = dt.datetime.fromtimestamp(self._pending_bucket + self._bar_sec).strftime("%H:%M")
-        return (self._t[i], top, hhmm)
-
-
-    def clear(self) -> None:
-        self._t.clear(); self._o.clear(); self._h.clear()
-        self._l.clear(); self._c.clear()
-        self._paths = None
-        self.update()
-
-    def _invalidate_last_block(self) -> None:
-        """live tick 只改最后一根 → 只作废最后一块缓存（原实现全量重建，tick 卡）。"""
-        if self._paths:
-            self._paths[-1] = (False, None, None)
-
-    # ---- pyqtgraph 绘制协议 ----
-    def boundingRect(self) -> QtCore.QRectF:  # noqa: N802
-        if not self._t:
-            return QtCore.QRectF()
-        if self._w is None:
-            self._w = (self._t[1] - self._t[0]) * 0.7 if len(self._t) > 1 else _H1 * 0.6
-        x_min = self._t[0] - self._w
-        x_max = self._t[-1] + self._w
-        y_lo = min(min(self._l), min(self._o), min(self._c))
-        y_hi = max(max(self._h), max(self._o), max(self._c))
-        return QtCore.QRectF(x_min, y_lo, x_max - x_min, y_hi - y_lo)
-
-    def paint(self, painter: QtGui.QPainter, option, widget=None) -> None:  # noqa: N802
-        if not self._t:
-            return
-        # 只重绘可见区段对应块（blazing fast 的直接来源：
-        # 十字线/光标每帧仅触发所在窗口的个别块，而非全量；
-        # live tick 只使最后一块失效 —— 修改后 tick 重造成本从
-        # 9599 根降为 600 根）
+    小数位数由整定间隔 spacing 推导：spacing≈2e-5 → 5 位，
+    绝不让 Qt 走 str/吧 scientific route。插值律：dec = ceil(-log10(spacing))。
+    过大 spacing 用整数（补 0 位）；与 0 完全重叠时按数值特异性容衲。"""
+    if not values:
+        return []
+    sp = abs(float(spacing)) if spacing else 1.0
+    if not (sp > 0) or not (sp == sp):   # nan/inf 防护
+        sp = 1.0
+    import math as _m
+    if sp >= 1.0:
+        dec = 0
+    else:
         try:
-            vr = self.viewRect()
-            x_lo, x_hi = vr.left(), vr.right()
-        except Exception:
-            x_lo, x_hi = self._t[0], self._t[-1]
-        if not (x_hi > x_lo) or x_hi < self._t[0] or x_lo > self._t[-1]:
-            return
-        half = self._w if isinstance(self._w, float) else _H1
-        i0 = max(bisect.bisect_left(self._t, x_lo - half), 0)
-        i1 = min(bisect.bisect_right(self._t, x_hi + half), len(self._t) - 1)
-        n_blocks = (len(self._t) + _PICTURE_STEP - 1) // _PICTURE_STEP
-        if self._paths is None:
-            self._paths = [(False, None, None)] * n_blocks
-        elif len(self._paths) != n_blocks:
-            if len(self._paths) < n_blocks:
-                self._paths = self._paths + [(False, None, None)] * (n_blocks - len(self._paths))
-            else:
-                self._paths = self._paths[:n_blocks]
-        b0 = i0 // _PICTURE_STEP
-        b1 = i1 // _PICTURE_STEP
-        last = min(b1, n_blocks - 1)
-        for bi in range(b0, last + 1):
-            valid, up, down = self._paths[bi]
-            if not valid:
-                valid, up, down = self._generate_block(bi)
-                self._paths[bi] = (valid, up, down)
-            painter.setPen(_PEN_UP); painter.setBrush(_BRUSH_UP)
-            painter.drawPath(up)
-            painter.setPen(_PEN_DN); painter.setBrush(_BRUSH_DN)
-            painter.drawPath(down)
+            dec = min(10, max(0, int(_m.ceil(-_m.log10(sp)))))
+        except (ValueError, OverflowError):
+            dec = 5
+    out = [f"{float(v):.{dec}f}" for v in values]
+    # 去尾零（保可读性）：'0.00020'→'0.0002'、'-0.000000'→'0'
+    return [s.rstrip("0").rstrip(".") if "." in s else s for s in out]
 
-    def _generate_block(self, bi: int):
-        """重造指定块（up_path/down_path 双色二分，一次 drawPath 一块）。"""
-        up = QtGui.QPainterPath()
-        down = QtGui.QPainterPath()
-        if self._w is None:
-            self._w = (self._t[1] - self._t[0]) * 0.7 if len(self._t) > 1 else _H1 * 0.6
-        half = self._w / 2
-        start = bi * _PICTURE_STEP
-        for i in range(start, min(start + _PICTURE_STEP, len(self._t))):
-            t, o, h, low, c = (
-                self._t[i], self._o[i], self._h[i], self._l[i], self._c[i]
-            )
-            path = up if c >= o else down
-            # 影线 + 实体合入同一个 path（一次 drawPath fill+stroke）
-            path.moveTo(t, h)
-            path.lineTo(t, low)
-            body_top = max(o, c)
-            body_bottom = min(o, c)
-            body_h = max(body_top - body_bottom, abs(o + c) * 1e-9)
-            if body_h > 0:
-                path.addRect(
-                    QtCore.QRectF(t - half, body_bottom, self._w, body_h)
-                )
-            else:
-                path.moveTo(t - half, body_bottom)
-                path.lineTo(t + half, body_bottom)
-        return (True, up, down)
+
+class _FixedFmtAxis(pg.AxisItem):
+    """定点小数数值轴：根除科学计数法（pyqtgraph 默认 tick 对
+    1e-4 量级值会走 e-枚计法）。spacing 精度自动适应缩放层级。"""
+
+    def tickStrings(self, values, scale, spacing):  # noqa: N802
+        if scale and scale != 1.0:
+            values = [v / scale for v in values]
+        return _fixed_ticks(values, spacing)
+_VIEW_BARS = 1200   # 载入后默认显示的最近数据点数（更早历史可拖动/缩放查看）
 
 
 class SpreadChart(QtWidgets.QWidget):
@@ -241,11 +110,11 @@ class SpreadChart(QtWidgets.QWidget):
         # Qt 渲染期异常风暴 → 段错误；且此前 PlotWidget 从未 addWidget 进布局，
         # 导致整个图表一曲空白灰底不渲染）。用顶部 QLabel 图例代替。
         self._legend_label = QtWidgets.QLabel(
-            '<span style="color:#4d8df0">— 价差/均值</span>&nbsp;&nbsp;&nbsp;'
+            '<span style="color:#4d8df0">— 价差（M1 合成）</span>&nbsp;&nbsp;&nbsp;'
+            '<span style="color:#c8cfda">— 均值</span>&nbsp;&nbsp;&nbsp;'
             '<span style="color:#ea3943">─ 上阈值（拖动调 k）</span>&nbsp;&nbsp;&nbsp;'
             '<span style="color:#16c784">─ 下阈值</span>&nbsp;&nbsp;&nbsp;'
-            '<span style="color:#16c784">▕▏</span><span style="color:#ea3943">▕▏</span>'
-            '<span style="color:#c8cfda"> 价差K线(H1)</span>'
+            '<span style="color:#f0b90b">·· 极值</span>'
         )
         self._legend_label.setTextFormat(QtCore.Qt.RichText)
         self._legend_label.setStyleSheet(
@@ -254,7 +123,8 @@ class SpreadChart(QtWidgets.QWidget):
         lay.addWidget(self._legend_label)
 
         self._plot = pg.PlotWidget(
-            axisItems={"bottom": pg.DateAxisItem(orientation="bottom")}
+            axisItems={"bottom": pg.DateAxisItem(orientation="bottom"),
+                       "left": _FixedFmtAxis(orientation="left")}
         )
         lay.addWidget(self._plot)
         self._plot.setBackground(_BG)
@@ -293,11 +163,6 @@ class SpreadChart(QtWidgets.QWidget):
         # 网格层间阈值线（DotLine 细线，动态重建）
         self._tier_items: list[pg.InfiniteLine] = []
 
-        # ---- 组合价差 OHLC 蜡烛（模式引 vnpy CandleItem/BarGenerator）----
-        self._candles = _CandlestickItem()
-        self._candles.setZValue(-1)   # 蜡烛垫底，价差线/阈值线在上层
-        self._plot.addItem(self._candles)
-        self._candles_visible = True
 
         # 长周期极值线 + 文本
         self._extreme_up = pg.InfiniteLine(
@@ -314,11 +179,6 @@ class SpreadChart(QtWidgets.QWidget):
         self._extreme_legend_label = "全窗极值"
         self._extreme_text = pg.TextItem("", color=_EXTREME, anchor=(0, 0))
         self._vb.addItem(self._extreme_text)
-
-        # "开盘中" 游标（当前 H1 未收线）
-        self._pending_text = pg.TextItem("", color=_K_UP, anchor=(0.5, 1))
-        self._pending_text.hide()
-        self._vb.addItem(self._pending_text)
 
         # ---- 十字光标 ----
         self._cross_v = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen(_CROSS, width=1))
@@ -347,14 +207,18 @@ class SpreadChart(QtWidgets.QWidget):
     # 数据接口（窗口由调用方控制）
     # ==================================================================
     def set_series(self, t: list[float], v: list[float]) -> None:
-        """历史全量替换：t=时间戳(s)，v=价差值。
+        """历史全量替换：t=时间戳(s)，v=价差折线点（M1 合成收盘）。
 
         数据一次写入恒定预分配 numpy 缓冲（容量不足才倍增），
         _redraw 只发缓冲切片，不再每次从 list 重建 np 数组。
-        """
+        桶宽（_bar_sec）从相邻时间差自动推出（M1=60、H1=3600），
+        用于默认视窗宽度计算与批量聚合提示。"""
         t_list = [float(x) for x in (t or [])]
         v_list = [float(x) for x in (v or [])]
         n = min(len(t_list), len(v_list))
+        # 折线桶宽不再依赖蜡烛：从相邻时间差推导（等距取样即周期）
+        if n >= 2 and t_list[1] > t_list[0]:
+            self._bar_sec = float(t_list[1] - t_list[0])
         self._buf_ensure(n)
         self._buf_t[:n] = t_list[:n]
         self._buf_v[:n] = v_list[:n]
@@ -394,39 +258,25 @@ class SpreadChart(QtWidgets.QWidget):
             self._redraw()
 
     # ==================================================================
-    # K线（组合价差 OHLC；模式引 vnpy ChartWizard：价差→蜡烛）
+    # K 线接口（已退役：折线方案；保留为 no-op 以防历史调用点断链）
     # ==================================================================
-    def set_candles(
-        self,
-        t: list[float], o: list[float], h: list[float],
-        l: list[float], c: list[float],
-    ) -> None:
-        """历史蜡烛全量替换（等长 OHLC 时间序列）。桶宽自动跟随数据（M1/H1）。"""
-        self._bar_sec = self._candles._bar_sec
-        self._candles.set_candles(t, o, h, l, c)
-        self._bar_sec = self._candles._bar_sec
-        self._pending_text.hide()
-        self._refresh_limits()
-        self._autorange_once()
+    def set_candles(self, t, o, h, l, c) -> None:  # noqa: N803
+        """历史蜡烛全量替换：K 线已退役（折线方案），保留接口为 no-op。"""
+        return
 
     def append_candle_tick(self, ts: float, price: float) -> None:
-        """live tick 聚合到当前蜡烛（跨入新桶则新增一根，桶宽由数据推导）。
-        等价于 vnpy ChartWizard 的 Tick→BarGenerator→update_bar 链路。"""
-        self._candles.update_last(float(price), float(ts))
-        self._update_pending_text()
-        self._refresh_limits()
+        """live tick 蜡烛聚合：K 线已退役，保留接口为 no-op（实时走 append_point）。"""
+        return
 
     def set_candles_visible(self, visible: bool) -> None:
-        self._candles_visible = bool(visible)
-        self._candles.setVisible(self._candles_visible)
+        """K 线可见性开关：K 线已退役，保留接口为 no-op。"""
+        return
 
     def clear_series(self) -> None:
         """清空序列并隐藏依赖数据的标记。"""
         self._t.clear()
         self._v.clear()
         # 缓冲长度同步：切片窗口归零（已分配容量保留，避免反复申请/释放）
-        self._candles.clear()
-        self._pending_text.hide()
         self._extreme_text.setText("")
         self._cross_text.hide()
         self._cross_v.hide()
@@ -530,17 +380,6 @@ class SpreadChart(QtWidgets.QWidget):
         self._update_extreme_text_pos()
         self._refresh_limits()
 
-    def _update_pending_text(self) -> None:
-        """开盘中游标：当前 H1 蜡烛未收线 → 文本在蜡烛顶上方。"""
-        info = self._candles.pending_info()
-        if info is None:
-            self._pending_text.hide()
-            return
-        t, top, hhmm = info
-        self._pending_text.setText(f"开盘中（收盘预计 {hhmm}）")
-        self._pending_text.setPos(t + _H1 / 2, top * 1.0005)
-        self._pending_text.show()
-
     # ==================================================================
     # 内部绘制逻辑
     # ==================================================================
@@ -552,11 +391,10 @@ class SpreadChart(QtWidgets.QWidget):
 
         默认窗口只展示最近 _VIEW_BARS 根蜡烛（更早的靠拖动/缩放查看），
         否则 9599 根全部挤在一屏，鼠标一动整幅重绘必然卡。"""
-        c_t = self._candles._t
-        if not self._t and not c_t:
+        if not self._t:
             return
-        xs = self._t + c_t
-        ys = self._v + self._candles._h + self._candles._l
+        xs = self._t
+        ys = self._v
         if not xs:
             return
         x_min_all, x_max_all = min(xs), max(xs)
@@ -568,10 +406,6 @@ class SpreadChart(QtWidgets.QWidget):
         # y 包络只取窗口内数据（窗口外的极值会把曲线压成一条线）
         x_cut = x_left + pad_x * 0.2
         ys_w = [v_ for t_, v_ in zip(self._t, self._v) if t_ >= x_cut]
-        for t_, h_, l_ in zip(c_t, self._candles._h, self._candles._l):
-            if t_ >= x_cut:
-                ys_w.append(h_)
-                ys_w.append(l_)
         if ys_w:
             y_lo, y_hi = min(ys_w), max(ys_w)
             pad_y = max((y_hi - y_lo) * 0.10, abs(y_hi or 1.0) * 0.01, 1e-9)
@@ -611,16 +445,13 @@ class SpreadChart(QtWidgets.QWidget):
 
     def _refresh_limits(self) -> None:
         """setLimits 防拖飞：把视图边界锁在数据+阈值+蜡烛的包络内（含少量边距）。"""
-        c_t, c_h, c_l = (self._candles._t, self._candles._h, self._candles._l)
-        xs = self._t + c_t
+        xs = self._t
         if not xs:
             self._plot.setLimits(xMin=None, xMax=None, yMin=None, yMax=None)
             return
         x_lo, x_hi = min(xs), max(xs)
         pad_x = max((x_hi - x_lo) * 0.05, 1.0)
         ys = list(self._v)
-        ys.extend(c_h)
-        ys.extend(c_l)
         ys.extend((
             self._mean + self._k * self._std,
             self._mean - self._k * self._std,
@@ -668,8 +499,8 @@ class SpreadChart(QtWidgets.QWidget):
             self._cross_v.hide()
             self._cross_h.hide()
             return
-        ts_axis = self._t if self._t else self._candles._t
-        vs_axis = self._v if self._t else self._candles._c
+        ts_axis = self._t
+        vs_axis = self._v
         if not ts_axis:
             self._cross_text.hide()
             self._cross_v.hide()
@@ -697,7 +528,7 @@ class SpreadChart(QtWidgets.QWidget):
             self._cross_last = time.monotonic()
             ts = dt.datetime.fromtimestamp(bucket).strftime("%Y-%m-%d %H:%M")
             v_at = vs_axis[idx]
-            self._cross_text.setText(f"{ts}\n价差 {v_at:+.4f}")
+            self._cross_text.setText(f"{ts}\n价差 {v_at:+.5f}")
         # 文本钉在视口右上角（不随光标挪动，不乱跳）
         xr, yr = self._vb.viewRange()
         self._cross_text.setPos(xr[1] - 8.0, yr[0] + 10.0)

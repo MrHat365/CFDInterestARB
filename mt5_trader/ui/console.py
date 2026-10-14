@@ -1560,23 +1560,17 @@ class AccountConsole(QtWidgets.QMainWindow):
             return
         payload = event.data["payload"]
         datasets = payload.get("datasets", {})
-        # 统计先验/长窗极值：H1 全窗（≥1 年）；图表与实时：M1（用户口径，断开最少）
+        # 统计先验/长窗极值：H1 全窗（≥1 年）；图表与实时：M1 折线
         nh1 = len(datasets.get("h1", {}).get("v", []))
         nm1 = len(datasets.get("m1", {}).get("v", []))
         self._append_log(
-            f"已加载历史价差：M1 × {nm1} 根（图表）/H1 × {nh1} 根（统计先验）…"
+            f"已加载价差折线：M1 × {nm1} 点（图表）/H1 × {nh1} 点（统计先验）…"
         )
         self._runner.set_history(datasets.get("h1", {}))
         self._hist_ready = True
-        # 图表：优先 M1（断开最少）；worker 未给 M1 时回退 H1
+        # 图表（纯折线）：优先 M1；worker 未给 M1 时回退 H1
         line = datasets.get("m1") or datasets.get("h1") or {"t": [], "v": []}
         self._chart.set_series(list(line["t"]), list(line["v"]))
-        candles = datasets.get("m1_candles") or datasets.get("h1_candles")
-        if candles:
-            self._chart.set_candles(
-                candles["t"], candles["o"], candles["h"],
-                candles["l"], candles["c"],
-            )
         self._push_thresholds()
         self._chart.set_extremes(self._runner.series.extremes())
         self._btn_start.setEnabled(True)
@@ -1677,16 +1671,15 @@ class AccountConsole(QtWidgets.QMainWindow):
                 model.update_cell(sym, "fl_pnl", pnl, text=f"{pnl:+,.2f}")
 
     def _apply_chart_tick(self, result: dict) -> None:
-        """数据先行：未监测也持续画实时曲线/蜡烛/统计，
+        """数据先行：未监测也持续画实时折线/统计，
         监测按钮只控制信号与下单，不再控制数据流。"""
         self._chart.append_point(result["ts"], result["spread"])
-        self._chart.append_candle_tick(result["ts"], result["spread"])
         self._push_thresholds()
         self._chart.set_extremes(result.get("extremes") or {})
         self._update_stats_label(result)
 
     def _handle_strategy(self, result: dict) -> None:
-        # 图表：live 增点 + 当前蜡烛聚合 + 阈值 + 极值
+        # 图表：live 增点 + 阈值 + 极值（折线方案无蜡烛）
         self._apply_chart_tick(result)
         signal = result.get("signal")
         if signal:
