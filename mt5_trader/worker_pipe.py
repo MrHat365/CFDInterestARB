@@ -17,6 +17,39 @@ import sys
 import threading
 from pathlib import Path
 
+REP_Q_MAXSIZE = 2048   # 回复队列上限：GUI 卡顿时丢弃最旧压入失败的事件而非阻塞 worker
+
+
+class _ReplyQueue(queue.Queue):
+    """worker → GUI 的有界回复队列（替代无界 queue.Queue）。
+
+    worker._send 只调用 .put()；这里覆写为 put_nowait，队列满（GUI 消费慢/
+    管道阻塞）时丢弃该条事件并计数，每 64 次向 stderr 提示一次。
+    丢弃的是历史行情/快照类事件，ORDER_RESULT 等关键事件靠 GUI 正常消费保障。"""
+
+    def __init__(self, maxsize: int = REP_Q_MAXSIZE) -> None:
+        super().__init__(maxsize=maxsize)
+        self.dropped = 0
+
+    def put(self, item, block=True, timeout=None):   # noqa: ARG002 与 Queue.put 签名兼容
+        # 不能走 self.put_nowait / 基类 put：Queue.put(block=False) 内部回调
+        # self.put_nowait、Queue.put_nowait 又回调 self.put，覆写后会无限递归；
+        # 故直接复刻 put_nowait 内部逻辑（_put + not_empty 通知）。
+        with self.not_full:
+            if self.maxsize > 0 and self._qsize() >= self.maxsize:
+                self.dropped += 1
+                if self.dropped % 64 == 0:
+                    print(
+                        f"[pipe-rep] 回复队列已满（maxsize={self.maxsize}），"
+                        f"累计丢弃 {self.dropped} 条事件",
+                        file=sys.stderr,
+                    )
+                return None
+            self._put(item)
+            self.unfinished_tasks += 1
+            self.not_empty.notify()
+        return None
+
 from mt5_trader.event_engine import Event  # noqa: F401
 from mt5_trader.constants import EVENT_DEAL_REQUEST  # noqa: F401
 from mt5_trader.worker import worker_main
@@ -39,7 +72,7 @@ def _jsonable(value):
 def main(port: int) -> None:
     sock = socket.create_connection(("127.0.0.1", port))
     req_q: "queue.Queue" = queue.Queue()
-    rep_q: "queue.Queue" = queue.Queue()
+    rep_q: "_ReplyQueue" = _ReplyQueue(REP_Q_MAXSIZE)
 
     # 读 config 一行（首条）
     reader = sock.makefile("r", encoding="utf-8")
@@ -58,14 +91,24 @@ def main(port: int) -> None:
 
     def forward_replies():
         """worker -> GUI：rep 一行一条事件（含 ORDER_RESULT 等）。"""
+        send_fail_reported = False   # 一次性日志：sendall 失败后线程退出（保持原语义）
         try:
             while True:
                 msg = rep_q.get()
                 payload = _jsonable(msg.get("payload"))
-                sock.sendall(
-                    (json.dumps({"type": msg.get("type", "eUnknown"),
-                                 "payload": payload}, ensure_ascii=False)
-                     + "\n").encode("utf-8"))
+                try:
+                    sock.sendall(
+                        (json.dumps({"type": msg.get("type", "eUnknown"),
+                                     "payload": payload}, ensure_ascii=False)
+                         + "\n").encode("utf-8"))
+                except Exception as exc:
+                    if not send_fail_reported:
+                        send_fail_reported = True
+                        print(
+                            f"[pipe-rep] 回复发送失败，转发线程退出: {exc!r}",
+                            file=sys.stderr,
+                        )
+                    return
         except Exception:
             pass
 

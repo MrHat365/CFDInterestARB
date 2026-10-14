@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import copy
 import math
 import queue as _queue
 import threading
@@ -144,6 +145,12 @@ class _Worker:
         self._algos: dict[str, _SpreadTaker] = {}
         self._vol_step_cache: dict[str, float] = {}
         self._algo_audits: list[_SpreadTaker] = []   # done 后等裸腿复核
+        # 价差历史后台线程：拉取/构造不再阻塞请求主循环（订单延迟）
+        # latest-wins：进行中的拉取不被打断，pending 恒为最新请求的 legs 快照
+        self._hist_lock = threading.Lock()
+        self._hist_evt = threading.Event()
+        self._hist_pending: list | None = None
+        self._hist_thread: threading.Thread | None = None
 
     # ------------------------------------------------------------------
     # 主循环
@@ -157,9 +164,26 @@ class _Worker:
         poller = threading.Thread(target=self._poll_loop, daemon=True)
         poller.start()
 
-        while not self._stop_evt.is_set():
-            self._process_requests(0.2)
+        self._hist_thread = threading.Thread(
+            target=self._history_loop, name="spread-history", daemon=True)
+        self._hist_thread.start()
 
+        poll_fail = 0
+        while not self._stop_evt.is_set():
+            try:
+                self._process_requests(0.2)
+            except Exception as exc:
+                self._push_error("req_loop", repr(exc))
+                poll_fail += 1
+                if poll_fail >= 6:
+                    self._push_error(
+                        "req_loop", f"请求主循环连续失败 {poll_fail} 次熔断退出")
+                    self._stop_evt.set()
+                    break
+                continue
+            poll_fail = 0
+
+        self._hist_evt.set()   # 唤醒历史线程以便其检测 stop 并退出
         self._connected = False
         with self._mt5_lock:
             try:
@@ -616,15 +640,11 @@ class _Worker:
         return 0.0
 
     def _send_spread_history(self, msg: dict) -> None:
-        """历史价差（乘法合成，用户公式）：
+        """历史价差（乘法合成，用户公式），转发给后台拉取线程。
 
-            合成买 USDJPY(Ask) = USDCHF Ask × CHFJPY Ask
-            价差 = 实际卖出 USDJPY (Bid) − 合成买入 USDJPY (Ask)
-
-        目标腿 = 卖出方向 |权重| 最大（实际报价基准），其余腿在 log
-        空间按带符号权重合成（w>0 取 ask 侧、w<0 取 bid 侧），
-        合成价 = exp(Σ s·log(side))；w=1 时严格等于逐项乘积。
-        序列与蜡烛同用 H1 对齐时间轴；bid 基 OHLC + 每腿当前点差近似 ask。"""
+        请求本身只做入队：M1(14400)+H1(9600) 的 copy_rates 拉取耗时 1~3s
+        （全程持 _mt5_lock），同步执行会阻塞请求主循环使 order 请求排队数秒。
+        latest-wins：进行中的拉取不被打断，pending 恒为最新请求的快照。"""
         legs = msg.get("legs", [])
         if not legs:
             self._push_error("spread_history", "legs 为空")
@@ -632,6 +652,39 @@ class _Worker:
         if len({leg["symbol"] for leg in legs}) != len(legs):
             self._push_error("spread_history", "legs 含重复 symbol")
             return
+        with self._hist_lock:
+            self._hist_pending = copy.deepcopy(legs)
+        self._hist_evt.set()
+        self._log("历史拉取已在后台排队")
+
+    def _history_loop(self) -> None:
+        """价差历史专用后台线程：循环取 latest-wins 的 pending legs 执行拉取。
+
+        与旧同步执行完全复用 _build_spread_dataset（内部持 _mt5_lock，
+        与轮询/交易线程互斥，保持现状）；rep_queue 线程安全，可直接 _send。
+        重复请求不丢最终数据（处理完 pending 后循环等下一个）；stop 退出。"""
+        while True:
+            self._hist_evt.wait()
+            if self._stop_evt.is_set():
+                return
+            self._hist_evt.clear()
+            while True:   # 处理 pending 直到为空（期间新请求持续覆盖）
+                with self._hist_lock:
+                    legs = self._hist_pending
+                    self._hist_pending = None
+                if legs is None:
+                    break
+                self._fetch_spread_history(legs)
+                if self._stop_evt.is_set():
+                    return
+            # pending 空且 evt 可能在 clear 前被再 set：循环回去 wait 确认
+
+    def _fetch_spread_history(self, legs: list) -> None:
+        """（后台线程）执行原 _send_spread_history 的拉取与构造。
+
+        旧版实现文档：合成买 USDJPY(Ask) = USDCHF Ask × CHFJPY Ask，
+        价差 = 实际卖出 Bid − 合成买入 Ask；目标腿 = 卖出方向 |权重| 最大，
+        其余腿在 log 空间按带符号权重合成（w>0 取 ask 侧、w<0 取 bid 侧）。"""
         # 目标腿：卖出方向（无则 |权重| 最大）
         tp = None
         tp_candidates = [

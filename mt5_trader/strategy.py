@@ -26,6 +26,8 @@ import collections
 import math
 import datetime as dt
 
+import numpy as np
+
 _DAY = 86_400.0
 
 
@@ -38,6 +40,7 @@ class SpreadSeries:
         self._v = collections.deque(maxlen=max_points)
         self._prior: dict | None = None   # {mean, std, n}，来自 H1 历史
         self._live_n = 0                  # live 成点计数（历史点不计入）
+        self._ext_cache: tuple[float, dict] | None = None  # extremes TTL 缓存 (缓存时刻, 结果)
 
     def append(self, ts: float, value: float) -> None:
         """追加一个 live 成点（历史点经 init_prior 载入，不走此接口）。"""
@@ -62,11 +65,12 @@ class SpreadSeries:
             self._t.append(ts_f)
             self._v.append(v_f)
             vs.append(v_f)
-        if len(vs) < 2:
+        vt = np.asarray(vs, dtype=float)
+        if vt.size < 2:
             return {}
-        mean = sum(vs) / len(vs)
-        var = sum((x - mean) ** 2 for x in vs) / (len(vs) - 1)
-        self._prior = {"mean": mean, "std": max(var ** 0.5, 1e-12), "n": len(vs)}
+        mean = float(vt.mean())
+        var = float(vt.var(ddof=1))
+        self._prior = {"mean": mean, "std": max(var ** 0.5, 1e-12), "n": int(vt.size)}
         self._live_n = 0
         return dict(self._prior)
 
@@ -91,14 +95,14 @@ class SpreadSeries:
         n = min(self.window, len(self._v))
         if n < 10:
             return {}
-        tail = list(self._v)[-n:]
-        mean = sum(tail) / n
-        var = sum((x - mean) ** 2 for x in tail) / (n - 1)
+        tail = np.asarray(list(self._v)[-n:], dtype=float)
+        mean = float(tail.mean())
+        var = float(tail.var(ddof=1))
         std = max(var ** 0.5, 1e-12)
         z = (tail[-1] - mean) / std
         return {
             "mean": mean, "std": std, "z": z,   # 上下界由 runner 的 k/grid_step 动态生成
-            "last": tail[-1],
+            "last": float(tail[-1]),
             "n_points": len(self._v),
         }
 
@@ -113,30 +117,32 @@ class SpreadSeries:
         """
         if now is None:
             now = dt.datetime.now().timestamp()
+        cached = self._ext_cache
+        if cached is not None and abs(now - cached[0]) < 60.0:
+            return dict(cached[1])
         keys = ("max_1y", "min_1y", "max_6m", "min_6m")
         if not self._v:
             return {}
-        one_year: list[tuple[float, float]] = []
-        half_year: list[float] = []
         cutoff_1y = now - 365 * _DAY
         cutoff_6m = now - 182 * _DAY
-        for t, v in zip(self._t, self._v):
-            if t < cutoff_1y:
-                continue
-            one_year.append((t, v))
-            if t >= cutoff_6m:
-                half_year.append(v)
-        if not one_year:
-            return dict.fromkeys(keys, None) | {"window_days": 0.0}
-        values_1y = [v for _, v in one_year]
-        values_6m = half_year
-        oldest_t = min(t for t, _ in one_year)
-        return {
-            "max_1y": max(values_1y), "min_1y": min(values_1y),
-            "max_6m": max(values_6m) if values_6m else None,
-            "min_6m": min(values_6m) if values_6m else None,
+        t_arr = np.asarray(self._t, dtype=float)
+        v_arr = np.asarray(self._v, dtype=float)
+        mask_1y = t_arr >= cutoff_1y
+        if not mask_1y.any():
+            result = dict.fromkeys(keys, None) | {"window_days": 0.0}
+            self._ext_cache = (now, result)
+            return dict(result)
+        values_1y = v_arr[mask_1y]
+        values_6m = v_arr[t_arr >= cutoff_6m]  # mask_6m ⊆ mask_1y（cutoff_6m > cutoff_1y）
+        oldest_t = float(t_arr[mask_1y].min())
+        result = {
+            "max_1y": float(values_1y.max()), "min_1y": float(values_1y.min()),
+            "max_6m": float(values_6m.max()) if values_6m.size else None,
+            "min_6m": float(values_6m.min()) if values_6m.size else None,
             "window_days": round((now - oldest_t) / _DAY, 1),
         }
+        self._ext_cache = (now, result)
+        return dict(result)
 
     def arrays(self) -> tuple[list[float], list[float]]:
         return list(self._t), list(self._v)

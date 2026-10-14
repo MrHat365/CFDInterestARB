@@ -28,8 +28,12 @@ from .constants import (
     EVENT_ALGO_REQUEST,
     EVENT_DEAL_REQUEST,
     EVENT_ORDER_REQUEST,
+    EVENT_STATUS,
     EVENT_SYMBOL_SUBSCRIBE,
 )
+
+# stderr 保留尾部大小（供调试排查 worker 崩溃原因）
+_STDERR_TAIL_LIMIT = 64 * 1024
 from .event_engine import Event, EventEngine
 
 # 直接透传给子进程 action 的事件（data 内带 session 与参数）
@@ -61,6 +65,9 @@ class AccountSession:
         self._conn: socket.socket | None = None
         self._reader: threading.Thread | None = None
         self._req_writer: threading.Thread | None = None
+        # stderr 尾部缓存（drain 线程写入，供崩溃后诊断）与丢弃行计数
+        self._stderr_tail: bytes = b""
+        self._stderr_lines = 0
 
         self._ee.register(EVENT_SYMBOL_SUBSCRIBE, self._on_event)
         self._ee.register(EVENT_ORDER_REQUEST, self._on_event)
@@ -101,6 +108,30 @@ class AccountSession:
             close_fds=True,
             cwd=str(Path(__file__).resolve().parent.parent),
         )
+
+        # stderr drain：PIPE 不读会把子进程写满阻塞（P0-3）。
+        # 常驻 daemon 线程持续丢弃并计数，仅保留最后 64KB 尾部在内存；
+        # 子进程退出时 read() 返回空，线程自然结束，stop() 不 join。
+        def drain_stderr():
+            buf = bytearray()
+            proc_stderr = self._proc.stderr
+            try:
+                while True:
+                    chunk = proc_stderr.read(8192)
+                    if not chunk:
+                        break
+                    self._stderr_lines += 1
+                    buf.extend(chunk)
+                    if len(buf) > _STDERR_TAIL_LIMIT:
+                        del buf[:len(buf) - _STDERR_TAIL_LIMIT]
+                    self._stderr_tail = bytes(buf)
+            except Exception:
+                pass
+
+        threading.Thread(target=drain_stderr,
+                         name=f"stderr-{self.name}",
+                         daemon=True).start()
+
         server = socket.socket()
         server.bind(("127.0.0.1", port))
         server.listen(1)
@@ -122,17 +153,46 @@ class AccountSession:
             server.close()
             return
 
-        # rep 线程（worker → 本地 rep 队列 → _forward_loop → 事件引擎）
+        # rep 线程（worker → 本地 rep 队列 → _forward_loop → 事件引擎）。
+        # 坏行只跳过不弃通道；EOF/OSError 在未主动 stop 时上报断线（R0-1）。
         def read_rep_lines():
+            bad_lines = 0
+            warned_bad = False
+
+            def notify_closed(detail: str) -> None:
+                if self._stopped:
+                    return
+                self._push(f"worker 读取通道断开(EOF/{detail})", "ERROR")
+                self._ee.put(Event(
+                    EVENT_STATUS,
+                    {"session": self.name,
+                     "payload": {"ok": False,
+                                 "msg": "worker 通道断开（子进程可能已退出）"}},
+                ))
+
             try:
-                for line in conn.makefile("r", encoding="utf-8"):
+                # errors="replace"：编码坏行降级为占位符，交由下方解析跳过，
+                # 避免解码异常在迭代中直接炸掉整条读线程
+                for line in conn.makefile("r", encoding="utf-8",
+                                          errors="replace"):
                     if not line.strip():
                         continue
-                    msg = json.loads(line)
+                    try:
+                        msg = json.loads(line)
+                    except ValueError:
+                        bad_lines += 1
+                        if bad_lines > 50 and not warned_bad:
+                            warned_bad = True
+                            self._push(
+                                f"worker 输出通道已跳过 {bad_lines} 条"
+                                "无法解析的行", "WARNING")
+                        continue
                     self._rep(msg.get("type", "eUnknown"),
                               msg.get("payload"))
-            except Exception:
-                pass
+            except OSError as exc:
+                notify_closed(repr(exc))
+            else:
+                notify_closed("")
 
         self._reader = threading.Thread(
             target=read_rep_lines, name=f"pipe-{self.name}", daemon=True)
@@ -226,14 +286,12 @@ class AccountSession:
 
     # ------------------------------------------------------------------
     def _send_raw(self, msg: dict) -> None:
+        # 仅入队：json 编码 + sendall 由 write_req_lines 写线程完成，
+        # 避免调用方线程（常为 UI）在管道写满时被 sendall 同步阻塞（P0-4）
         if self._conn is None or self._stopped:
             self._push(f"消息发送失败（会话未准）: {msg.get('action', '')}", "ERROR")
             return
-        try:
-            self._conn.sendall((json.dumps(msg, ensure_ascii=False) + "\n")
-                               .encode("utf-8"))
-        except Exception as exc:
-            self._push(f"消息发送失败: {exc!r}", "ERROR")
+        self._req_q.put(msg)
 
     def _push(self, msg: str, level: str = "INFO") -> None:
         from .constants import EVENT_LOG

@@ -54,6 +54,15 @@ _C_MONEY_ZERO = "#8b93a3"
 _MONO_FONT = "Consolas"
 
 
+class _CallInMain(QtCore.QObject):
+    """跨线程回调桥：worker 线程 emit(call, fn)，主线程槽内执行 fn。
+
+    Qt 自动把跨线程 emit 转为 QueuedConnection，保证 fn 在主线程执行（UI 安全）。
+    """
+
+    call = QtCore.Signal(object)
+
+
 class ColumnSpec(NamedTuple):
     """MiniTable 列定义。
 
@@ -486,6 +495,8 @@ class RatioSplitter(QtWidgets.QSplitter):
 class AccountConsole(QtWidgets.QMainWindow):
     """单账户控制台独立窗口（原合理骨架 + 样式升级）。"""
 
+    # 信号行上限（_signals_rows 无界增长会拖慢 set_rows 全量重建）
+    _SIGNALS_CAP = 600
     def __init__(self, event_engine, account: dict, store: AccountsStore,
                  db: Database, on_closed=None) -> None:
         super().__init__()
@@ -505,6 +516,13 @@ class AccountConsole(QtWidgets.QMainWindow):
         self._hist_ready = False
         self._account_currency = "USD"
         self._conn_state = "waiting"
+        self._opp_thread = False        # 机会计算线程在跑（防重入）
+        self._auto_load_pending = False  # 自动载入首个组合挂起（后台计算完成后消费）
+        self._last_hist_req = 0.0       # 上次历史价差请求时间（60s 节流）
+
+        # 后台线程 -> 主线程回调桥（机会计算结果投递等）
+        self._callin = _CallInMain(self)
+        self._callin.call.connect(lambda fn: fn())
         self.session_name = f'{account["login"]}@{account["server"]}'
 
         self.setWindowTitle(f"控制台 — {self.session_name}")
@@ -886,6 +904,11 @@ class AccountConsole(QtWidgets.QMainWindow):
             self._on_closed(self.session_name)
 
     def closeEvent(self, e) -> None:  # noqa: N802
+        # 显式停掉定时器/回调，防关闭后回调已销毁对象
+        self._conn_timer.stop()
+        flush = getattr(self._chart, "_curve_flush", None)
+        if flush is not None:
+            flush.stop()
         self.stop_session_and_close()
         super().closeEvent(e)
 
@@ -980,13 +1003,13 @@ class AccountConsole(QtWidgets.QMainWindow):
     # 合并数据表（规则 + 隔夜利息 -> 一行一品种，可排序）
     # ------------------------------------------------------------------
     def _auto_load_first_opportunity(self, *_a) -> None:
-        """连接成功后自动生成并载入首个组合（主图立即有数据，无需两步点击）。"""
+        """连接成功后自动生成并载入首个组合（主图立即有数据，无需两步点击）。
+
+        机会计算在后台线程跑，载入动作由 _opportunities_ready 在结果到达后接手。"""
         if self._current_legs or not self._swaps_payload:
             return
+        self._auto_load_pending = True
         self._generate_opportunities()
-        if self._opportunities:
-            self._append_log("已自动载入最优组合（可在【交易机会】页另选）")
-            self._set_opportunity(self._opportunities[0])
 
     def _refresh_data_table(self) -> None:
         from ..constants import SWAP_MODE_NAME, WEEKDAY_NAME
@@ -1034,7 +1057,12 @@ class AccountConsole(QtWidgets.QMainWindow):
                 if isinstance(rollover, int) else "-",
                 "update_time": update or self._swaps_fetched_at or "-",
             })
-        self._tbl_data.set_rows(rows)
+        # 全量重建行时暂停重绘，避免大表刷新掉帧
+        self._tbl_data.setUpdatesEnabled(False)
+        try:
+            self._tbl_data.set_rows(rows)
+        finally:
+            self._tbl_data.setUpdatesEnabled(True)
 
     def _toggle_watch(self, on: bool) -> None:
         if self._session is None:
@@ -1048,19 +1076,54 @@ class AccountConsole(QtWidgets.QMainWindow):
     # 交易机会
     # ------------------------------------------------------------------
     def _generate_opportunities(self) -> None:
+        if self._opp_thread:
+            self._append_log("机会计算进行中…")
+            return
         if not self._swaps_payload:
             QtWidgets.QMessageBox.information(
                 self, "提示",
                 "请先在【规则·隔夜利息】页开启自动检测/在连接后等待首轮数据。"
             )
             return
-        opportunities = generate(
-            self._swaps_payload.get("all", []),
-            fx_rates=self._swaps_payload.get("fx_rates"),
-            max_legs=self._spin_max_legs.value(),
-            cap=100,
-            account_currency=self._account_currency or "USD",
-        )
+        payload = self._swaps_payload
+        max_legs = self._spin_max_legs.value()
+        account_currency = self._account_currency or "USD"
+        self._opp_thread = True
+
+        def _run() -> None:
+            opps: list[dict] = []
+            err: BaseException | None = None
+            try:
+                opps = generate(
+                    payload.get("all", []),
+                    fx_rates=payload.get("fx_rates"),
+                    max_legs=max_legs,
+                    cap=100,
+                    account_currency=account_currency,
+                )
+            except Exception as exc:   # 保持旧行为的容错性：失败不冻结 UI，仅提示
+                opps = []
+                err = exc
+            finally:
+                # 结果回到主线程再改 UI（_opportunities / 表格 / 弹窗）
+                self._callin.call.emit(
+                    lambda: self._opportunities_ready(opps, err)
+                )
+
+        threading.Thread(
+            target=_run,
+            name=f"opp-gen-{self.session_name}",
+            daemon=True,
+        ).start()
+
+    def _opportunities_ready(self, opportunities: list[dict],
+                             err: BaseException | None = None) -> None:
+        """后台 generate() 完成后的主线程收尾（原 _generate_opportunities 尾部逻辑）。"""
+        self._opp_thread = False
+        if err is not None:
+            self._auto_load_pending = False
+            self._append_log(f"机会计算失败: {err}")
+            return
         self._opportunities = opportunities
         self._fill_opp_table(opportunities)
         if not opportunities:
@@ -1069,6 +1132,12 @@ class AccountConsole(QtWidgets.QMainWindow):
                 "当前品种集中未发现可中性化的 2~5 腿组合。\n"
                 "（涉及币种缺 fx_rates 汇率快照的组合会被跳过）",
             )
+            return
+        if self._auto_load_pending:
+            self._auto_load_pending = False
+            if self._opportunities:
+                self._append_log("已自动载入最优组合（可在【交易机会】页另选）")
+                self._set_opportunity(self._opportunities[0])
 
     def _fill_opp_table(self, opportunities: list[dict]) -> None:
         rows = []
@@ -1170,9 +1239,9 @@ class AccountConsole(QtWidgets.QMainWindow):
                 EVENT_SYMBOL_SUBSCRIBE,
                 {"session": self.session_name, "symbol": leg["symbol"]},
             ))
-        # 自动请求历史价差（到达后启用"开始监测"并初始化统计）
+        # 自动请求历史价差（到达后启用"开始监测"并初始化统计；60s 节流防重复拉取）
         self._ensure_runner()
-        self._sess_repeat(lambda s: s.request_spread_history(self._cleaned_legs()))
+        self._request_spread_history_guarded()
         self._tabs.setCurrentWidget(self._tabs.widget(2))   # 载入即切策略控制台
         self._append_log(
             f"已载入组合并订阅 {len(opp['legs'])} 个腿的行情: {opp['legs_text']}"
@@ -1266,6 +1335,15 @@ class AccountConsole(QtWidgets.QMainWindow):
     def _load_history(self) -> None:
         if not self._ensure_runner():
             return
+        self._request_spread_history_guarded()
+
+    def _request_spread_history_guarded(self) -> None:
+        """历史价差请求 60s 节流：窗口内已发过则跳过，避免重复拉取刷屏/压 worker。"""
+        now = time.time()
+        if now - self._last_hist_req < 60.0:
+            self._append_log("历史价差 60 秒内已请求过，本次跳过")
+            return
+        self._last_hist_req = now
         self._sess_repeat(lambda s: s.request_spread_history(self._cleaned_legs()))
 
     def _on_spread_history(self, event) -> None:
@@ -1310,7 +1388,7 @@ class AccountConsole(QtWidgets.QMainWindow):
             return
         if not self._hist_ready:
             self._append_log("历史价差尚未就绪，正在自动重拉…")
-            self._load_history()
+            self._request_spread_history_guarded()
             return
         self._monitoring = True
         self._btn_start.setText("■ 停止监测")
@@ -1469,6 +1547,10 @@ class AccountConsole(QtWidgets.QMainWindow):
             "mode": mode,
             "remark": remark,
         })
+        # 超过上限删最旧（列表正序 append，头部即最旧），保 table/统计基于 cap 后列表
+        overflow = len(self._signals_rows) - self._SIGNALS_CAP
+        if overflow > 0:
+            del self._signals_rows[:overflow]
         self._tbl_signals.set_rows(list(reversed(self._signals_rows)))
         if signal["action"] in ("open", "close"):
             legs_desc = [

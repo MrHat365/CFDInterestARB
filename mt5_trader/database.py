@@ -78,6 +78,11 @@ class Database:
         self.path = Path(path) if path else Path(__file__).parent / "mt5_trader.db"
         self._conn = sqlite3.connect(self.path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
+        # 一次性 PRAGMA：WAL 提升并发读写，busy_timeout 避免锁争用抛错，
+        # synchronous=NORMAL 在 WAL 下安全且减少 fsync。
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA busy_timeout=3000")
+        self._conn.execute("PRAGMA synchronous=NORMAL")
         self._lock = threading.Lock()
         with self._lock:
             self._conn.executescript(SCHEMA)
