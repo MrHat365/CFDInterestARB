@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import queue
+import sys
 import threading
 import traceback
 from typing import Any, Callable, NamedTuple
@@ -24,7 +25,10 @@ Handler = Callable[[Event], None]
 
 class EventEngine:
     def __init__(self) -> None:
-        self._queue: "queue.Queue[Event]" = queue.Queue()
+        # 有界队列（maxsize=5000）：防止慢消费者场景下内存无界增长。
+        self._queue: "queue.Queue[Event]" = queue.Queue(maxsize=5000)
+        # 满载丢最旧事件的累计计数；每丢满 50 个向 stderr 打一行告警。
+        self.dropped = 0
         self._active = False
         self._thread: threading.Thread | None = None
         self._handlers: dict[str, set[Handler]] = {}
@@ -56,7 +60,26 @@ class EventEngine:
     # 发布与生命周期
     # ------------------------------------------------------------------
     def put(self, event: Event) -> None:
-        self._queue.put(event)
+        # 队列满时丢最旧保最新（后台分发线程 concurrent get 会并发取走事件，
+        # get_nowait 可能撞 Empty；简单 try/except 兜底即可，不做双重加锁）。
+        try:
+            self._queue.put_nowait(event)
+        except queue.Full:
+            try:
+                self._queue.get_nowait()   # 丢弃最旧事件
+            except queue.Empty:
+                pass
+            self.dropped += 1
+            if self.dropped % 50 == 0:
+                print(
+                    f"[EventEngine] queue full, dropped total={self.dropped}",
+                    file=sys.stderr,
+                )
+            try:
+                self._queue.put_nowait(event)
+            except queue.Full:
+                # 并发消费者瞬间取空又满的极端竞态：放弃本条（仍计入 dropped）。
+                self.dropped += 1
 
     def start(self) -> None:
         if self._active:

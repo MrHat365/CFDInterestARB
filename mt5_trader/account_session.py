@@ -21,6 +21,7 @@ import socket
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Any, Callable
 
@@ -34,6 +35,11 @@ from .constants import (
 
 # stderr 保留尾部大小（供调试排查 worker 崩溃原因）
 _STDERR_TAIL_LIMIT = 64 * 1024
+
+# 心跳参数：每 5s ping 一次；15s 无任何 rep 回包记一次未命中，连续 3 次判死
+_HEARTBEAT_INTERVAL = 5.0
+_HEARTBEAT_TIMEOUT = 15.0
+_HEARTBEAT_MAX_MISSES = 3
 from .event_engine import Event, EventEngine
 
 # 直接透传给子进程 action 的事件（data 内带 session 与参数）
@@ -65,6 +71,10 @@ class AccountSession:
         self._conn: socket.socket | None = None
         self._reader: threading.Thread | None = None
         self._req_writer: threading.Thread | None = None
+        # 心跳线程与其 wakeup/退出事件；_last_rep_at 最近一次收到 rep 行的单调钟
+        self._heartbeat: threading.Thread | None = None
+        self._hb_stop = threading.Event()
+        self._last_rep_at: float = time.monotonic()
         # stderr 尾部缓存（drain 线程写入，供崩溃后诊断）与丢弃行计数
         self._stderr_tail: bytes = b""
         self._stderr_lines = 0
@@ -175,6 +185,8 @@ class AccountSession:
                 # 避免解码异常在迭代中直接炸掉整条读线程
                 for line in conn.makefile("r", encoding="utf-8",
                                           errors="replace"):
+                    # 任一行（合法/坏行/空行）都证明 worker 侧还活着 → 喂心跳
+                    self._last_rep_at = time.monotonic()
                     if not line.strip():
                         continue
                     try:
@@ -214,6 +226,45 @@ class AccountSession:
             target=write_req_lines, name=f"req-{self.name}", daemon=True)
         self._req_writer.start()
 
+        # 心跳线程：定期 ping worker，连续 15s 无 rep 回包 ×3 判死（不 join 子进程）
+        self._last_rep_at = time.monotonic()
+        self._hb_stop.clear()
+
+        def heartbeat_loop():
+            misses = 0
+            while True:
+                if self._hb_stop.wait(_HEARTBEAT_INTERVAL):
+                    return
+                if self._stopped:
+                    return
+                self._send_raw({"action": "ping"})
+                if time.monotonic() - self._last_rep_at >= _HEARTBEAT_TIMEOUT:
+                    misses += 1
+                    if misses >= _HEARTBEAT_MAX_MISSES:
+                        if not self._stopped:
+                            self._stopped = True
+                            self._push("心跳超时（15s+ 无 worker 回包）", "ERROR")
+                            self._ee.put(Event(
+                                EVENT_STATUS,
+                                {"session": self.name,
+                                 "payload": {"ok": False,
+                                             "msg": ("worker 心跳超时，"
+                                                     "会话可能已死亡")}},
+                            ))
+                            # 关读端让 pipe 线程自然退出（仿 stop，不 join 子进程）
+                            try:
+                                if self._conn is not None:
+                                    self._conn.shutdown(socket.SHUT_RDWR)
+                            except Exception:
+                                pass
+                        return
+                else:
+                    misses = 0
+
+        self._heartbeat = threading.Thread(
+            target=heartbeat_loop, name=f"hb-{self.name}", daemon=True)
+        self._heartbeat.start()
+
         self._push("会话已启动（subprocess+管道）", "INFO")
 
     def _rep(self, etype: str, payload: Any) -> None:
@@ -228,6 +279,11 @@ class AccountSession:
         if self._stopped:
             return
         self._stopped = True
+        # 收心跳线程（Event 置位 + 短 join，避免线程再 ping/误告警）
+        self._hb_stop.set()
+        hb = self._heartbeat
+        if hb is not None and hb.is_alive():
+            hb.join(timeout=0.2)
         self._send_raw({"action": "stop", "close_terminal": close_terminal})
         try:
             conn = self._conn

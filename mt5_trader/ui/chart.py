@@ -219,6 +219,11 @@ class SpreadChart(QtWidgets.QWidget):
         # 图形状态
         self._t: list[float] = []
         self._v: list[float] = []
+        # 恒定预分配 numpy 缓冲（容量按需倍增）：_redraw/setData 只发缓冲切片
+        # [self._buf_t[:n], self._buf_v[:n]]，避免每次从 Python list 重建
+        # np 数组；_t/_v 仍保留供 bisect 十字光标与 pending 逻辑使用。
+        self._buf_t: np.ndarray = np.empty(0, dtype=float)
+        self._buf_v: np.ndarray = np.empty(0, dtype=float)
         self._mean = 0.0
         self._std = 1e-12
         self._k = 2.0
@@ -342,16 +347,43 @@ class SpreadChart(QtWidgets.QWidget):
     # 数据接口（窗口由调用方控制）
     # ==================================================================
     def set_series(self, t: list[float], v: list[float]) -> None:
-        """历史全量替换：t=时间戳(s)，v=价差值。"""
-        self._t = [float(x) for x in (t or [])]
-        self._v = [float(x) for x in (v or [])]
+        """历史全量替换：t=时间戳(s)，v=价差值。
+
+        数据一次写入恒定预分配 numpy 缓冲（容量不足才倍增），
+        _redraw 只发缓冲切片，不再每次从 list 重建 np 数组。
+        """
+        t_list = [float(x) for x in (t or [])]
+        v_list = [float(x) for x in (v or [])]
+        n = min(len(t_list), len(v_list))
+        self._buf_ensure(n)
+        self._buf_t[:n] = t_list[:n]
+        self._buf_v[:n] = v_list[:n]
+        self._t = t_list
+        self._v = list(v_list[:n])
         self._redraw()
         self._autorange_once()
 
+    def _buf_ensure(self, n: int) -> None:
+        """恒定缓冲容量保证 >= n：容量按需倍增，够用时复用不重分配。"""
+        cap = len(self._buf_t)
+        if n <= cap:
+            return
+        new_cap = cap or 128
+        while new_cap < n:
+            new_cap *= 2
+        self._buf_t = np.empty(new_cap, dtype=float)
+        self._buf_v = np.empty(new_cap, dtype=float)
+
     def append_point(self, t: float, v: float) -> None:
         """live 增点（追加）；setData 限频 200ms，避免每 tick 全量重建曲线。"""
-        self._t.append(float(t))
-        self._v.append(float(v))
+        t_f = float(t)
+        v_f = float(v)
+        self._t.append(t_f)
+        self._v.append(v_f)
+        n = len(self._t)
+        self._buf_ensure(n)
+        self._buf_t[n - 1] = t_f
+        self._buf_v[n - 1] = v_f
         self._curve_dirty = True
         if not self._curve_flush.isActive():
             self._curve_flush.start(200)
@@ -392,6 +424,7 @@ class SpreadChart(QtWidgets.QWidget):
         """清空序列并隐藏依赖数据的标记。"""
         self._t.clear()
         self._v.clear()
+        # 缓冲长度同步：切片窗口归零（已分配容量保留，避免反复申请/释放）
         self._candles.clear()
         self._pending_text.hide()
         self._extreme_text.setText("")
@@ -554,13 +587,17 @@ class SpreadChart(QtWidgets.QWidget):
         self._update_extreme_text_pos()
 
     def _redraw(self) -> None:
-        if not self._t:
+        n = len(self._t)
+        if not n:
             # 空数据不能用 setData([], [])（pg 无法识别空列表），改用 clear()
             self._curve_spread.clear()
             self._curve_mean.clear()
         else:
-            self._curve_spread.setData(self._t, self._v)
-            self._curve_mean.setData(self._t, np.full(len(self._v), self._mean))
+            # 只发恒定缓冲切片：无 list→np 重建，flush 全量重设避免 O(n) 重建开销
+            buf_t = self._buf_t[:n]
+            buf_v = self._buf_v[:n]
+            self._curve_spread.setData(buf_t, buf_v)
+            self._curve_mean.setData(buf_t, np.full(n, self._mean))
         self._update_extreme_text_pos()
         self._refresh_limits()
 
@@ -569,7 +606,8 @@ class SpreadChart(QtWidgets.QWidget):
             self._extreme_text.setPos(self._t[0], self._v_max())
 
     def _v_max(self) -> float:
-        return float(np.max(self._v)) if self._v else 0.0
+        n = len(self._v)
+        return float(self._buf_v[:n].max()) if n else 0.0
 
     def _refresh_limits(self) -> None:
         """setLimits 防拖飞：把视图边界锁在数据+阈值+蜡烛的包络内（含少量边距）。"""

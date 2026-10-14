@@ -44,6 +44,21 @@ from .spreads import round_to_step
 
 MAGIC_DEFAULT = 260100
 
+# UI 心跳应答事件名（与 account_session 的 ping/pong 心跳协议对应；
+# 容忍其未进 constants.py：仅 worker↔UI 传输层使用，不触发其它副作用）。
+_EVENT_PONG = "ePong"
+
+# 重报价类可重试 retcode（来自 MetaTrader5 常量包）：
+# REQUOTE=10004 / PRICE_CHANGED=10020 / PRICE_OFF=10021 ——
+# 价格已变/无有效报价，重取最新 tick 重发即可，属瞬态失败。
+_REQUOTE_RETCODES = frozenset({
+    mt5.TRADE_RETCODE_REQUOTE,
+    mt5.TRADE_RETCODE_PRICE_OFF,
+    mt5.TRADE_RETCODE_PRICE_CHANGED,
+})
+_ORDER_MAX_RETRIES = 2     # 重报价最多重试次数（首次发单不计入）
+_ORDER_RETRY_BACKOFF = 0.3  # 每次重试前退避（秒）——等行情/柜台刷新报价
+
 
 def _f(v, default: float = 0.0) -> float:
     """payload 数值安全取值：None/非法 -> default（bool 视为非法）。"""
@@ -145,6 +160,9 @@ class _Worker:
         self._algos: dict[str, _SpreadTaker] = {}
         self._vol_step_cache: dict[str, float] = {}
         self._algo_audits: list[_SpreadTaker] = []   # done 后等裸腿复核
+        # 订单/价差算法专用串行队列：请求主循环只入队，由 _order_loop 线程
+        # 逐条消费发单（同一时刻只有一个订单在 order_send，保持顺序化语义）
+        self._order_q: _queue.Queue = _queue.Queue()
         # 价差历史后台线程：拉取/构造不再阻塞请求主循环（订单延迟）
         # latest-wins：进行中的拉取不被打断，pending 恒为最新请求的 legs 快照
         self._hist_lock = threading.Lock()
@@ -167,6 +185,10 @@ class _Worker:
         self._hist_thread = threading.Thread(
             target=self._history_loop, name="spread-history", daemon=True)
         self._hist_thread.start()
+
+        self._order_thread = threading.Thread(
+            target=self._order_loop, name="orders", daemon=True)
+        self._order_thread.start()
 
         poll_fail = 0
         while not self._stop_evt.is_set():
@@ -321,7 +343,12 @@ class _Worker:
         if action == "subscribe":
             self._subscribe(str(msg["symbol"]))
         elif action == "order":
-            self._handle_order(msg["request"])
+            # 收到即入队：发单的 order_send 网络等待移到 _order_loop 线程，
+            # 请求主循环不再被阻塞（其余 action 仍同步处理）
+            self._order_q.put(msg)
+        elif action == "ping":
+            # UI 心跳（与 account_session 心跳协议对应）：只回 pong，无其它副作用
+            self._send(_EVENT_PONG, {"ts": time.time()})
         elif action == "deals":
             self._send_deals(int(msg.get("days", 7)))
         elif action == "rules":
@@ -333,7 +360,7 @@ class _Worker:
         elif action == "spread_history":
             self._send_spread_history(msg)
         elif action == "spread_algo":
-            self._start_spread_algo(msg)
+            self._order_q.put(msg)   # 算法首腿发单同走订单线程（见 order 分支）
         elif action == "stop":
             self._stop_evt.set()
             self._swap_watch_evt.set()
@@ -720,6 +747,32 @@ class _Worker:
             "fetched_at": time.time(),
         })
 
+    # ------------------------------------------------------------------
+    # 订单/算法线程（请求主循环只入队，串行发单保持顺序化语义）
+    # ------------------------------------------------------------------
+    def _order_loop(self) -> None:
+        """订单/价差算法专用线程：串行消费 _order_q。
+
+        同一时刻只有一个订单在 order_send（与旧主循环同步发单等价的
+        顺序化语义）；order_send 的网络等待不再阻塞 subscribe/rules/
+        deals/spread_history 等其余请求。stop 时退出（原有语义：stop
+        之后的排队请求不再执行）。"""
+        while True:
+            try:
+                msg = self._order_q.get(timeout=0.2)
+            except _queue.Empty:
+                if self._stop_evt.is_set():
+                    return
+                continue
+            try:
+                action = msg.get("action")
+                if action == "order":
+                    self._handle_order(msg["request"])
+                elif action == "spread_algo":
+                    self._start_spread_algo(msg)
+            except Exception as exc:
+                self._push_error("order_loop", repr(exc))
+
     def _build_spread_dataset(self, legs, target_sym, tf_name, tf, count):
         """单周期的乘法合成价差序列 + 蜡烛（用户公式）。
 
@@ -871,14 +924,34 @@ class _Worker:
             self._push_result(False, f"未知订单类型: {kind}", request)
             return
 
+        # 重报价重试：result None 或 REQUOTE/PRICE_OFF/PRICE_CHANGED 视为瞬态
+        # 失败，重取最新 tick 重发（每次前退避 _ORDER_RETRY_BACKOFF 秒）。
+        # 结构性错误（如无效手数/无品种）不在重试集内，首次失败即返回。
+        retries = 0
+        while result is None or result.retcode in _REQUOTE_RETCODES:
+            if retries >= _ORDER_MAX_RETRIES:
+                break
+            retries += 1
+            time.sleep(_ORDER_RETRY_BACKOFF)
+            # _build_market/_build_close 内部重新调用 _tick 取最新价
+            result = self._build_market(request) if kind == "market" else (
+                self._build_close(request) if kind == "close" else
+                self._build_cancel(request))
+
         if result is None:
-            self._push_result(False, f"order_send 返回 None: {mt5.last_error()}", request)
+            self._push_result(
+                False,
+                f"order_send 返回 None: {mt5.last_error()}"
+                + (f"（已重试 {retries} 次）" if retries else ""),
+                request,
+            )
             self._notify_algo_failure(request)
             return
         if result.retcode != TRADE_RETCODE_DONE:
             self._push_result(
                 False,
-                f"被服务器拒绝 retcode={result.retcode} comment={result.comment}",
+                f"被服务器拒绝 retcode={result.retcode} comment={result.comment}"
+                + (f"（已重试 {retries} 次）" if retries else ""),
                 request,
             )
             self._notify_algo_failure(request)

@@ -15,6 +15,7 @@ RETCODE_NAME 未收录的 retcode 一律兜底为 "未知 retcode NNNNN"（NNNNN
 from __future__ import annotations
 
 import re
+import time
 from typing import Any, Callable
 
 from PySide6 import QtCore, QtWidgets
@@ -101,6 +102,10 @@ class Toast(QtWidgets.QFrame):
                 "color: #d7dee6; background: transparent; border: none;"
             )
             box.addWidget(body_label)
+        else:
+            body_label = None
+        self._body_label: QtWidgets.QLabel | None = body_label
+        self._title_label: QtWidgets.QLabel = title_label
 
         if on_click is not None:
             self.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
@@ -133,6 +138,24 @@ class Toast(QtWidgets.QFrame):
         """停止进行中的淡入/淡出动画（复用本条 Toast 前调用）。"""
         self._fade.stop()
 
+    def _update_text(self, title: str, body: str) -> None:
+        """复用现存 Toast：更新标题/正文本（用于同类合并计次入文本）。"""
+        try:
+            self._title_label.setText(title)
+            if self._body_label is None:
+                if body:
+                    label = QtWidgets.QLabel(body, self)
+                    label.setWordWrap(True)
+                    label.setStyleSheet(
+                        "color: #d7dee6; background: transparent; border: none;"
+                    )
+                    self.layout().addWidget(label)
+                    self._body_label = label
+            else:
+                self._body_label.setText(body)
+        except Exception:
+            pass
+
     def mouseReleaseEvent(self, event) -> None:  # noqa: N802 (Qt 命名)
         if event.button() == QtCore.Qt.MouseButton.LeftButton and self._on_click:
             try:
@@ -148,7 +171,9 @@ class ToastManager(QtWidgets.QWidget):
     WIDTH = 280
     MARGIN = 12
     GAP = 6
-    MAX_TOASTS = 3
+    # 屏幕同时可见的 Toast 数上限。调到 6：右下角仍留视野给主界面控件，
+    # 又足够覆盖不同 session/level 的分类结果；同类重复已被去重合并吸收。
+    MAX_TOASTS = 6
 
     # EventEngine 后台线程只 emit 这些 Signal，槽在 Qt 主线程执行
     order_result_event = QtCore.Signal(object)
@@ -161,6 +186,14 @@ class ToastManager(QtWidgets.QWidget):
         self._engine: Any = None
         self._handlers: list[tuple[str, Any]] = []
         self._toasts: list[Toast] = []
+        # 同类合并限流：key = (session_name, level, title) ->
+        # (最近一次弹出的单调钟时刻, 总累计条数)。
+        # 在 DUP_WINDOW_SEC 内同 key 重复只弹一次，后续仅累加计
+        # 数并把计数合并进文本，避免事件风暴刷屏。
+        self._dup_window_sec: float = 5.0
+        self._last_shown: dict[
+            tuple[str | None, str, str], tuple[float, int]
+        ] = {}
 
         self._layout = QtWidgets.QVBoxLayout(self)
         self._layout.setContentsMargins(0, 0, 0, 0)
@@ -211,11 +244,30 @@ class ToastManager(QtWidgets.QWidget):
         ms: int = 3000,
         on_click: Callable[[], None] | None = None,
     ) -> None:
-        """新增一条 Toast；超过 3 条立即挤掉最旧的，超时（ms）后淡出销毁。"""
+        """新增一条 Toast；同类（同 session/level/标题）在去重窗口内
+        只弹一次，后续重复仅合并计次入文本；超过 MAX_TOASTS 立即挤掉
+        最旧的，超时（ms）后淡出销毁。
+        """
+        key = (self._session_name, level, title)
+        now = time.monotonic()
+        last_ts, _last_count = self._last_shown.get(key, (None, 0))
+        count = 1
+        if last_ts is not None and (now - last_ts) < self._dup_window_sec:
+            count = _last_count + 1
+        self._last_shown[key] = (now, count)
+        if count > 1:
+            # 只更新现存 Toast 的文案（合并计次），不重复弹窗
+            toast = self._find_toast(key)
+            if toast is not None:
+                self._update_merged_body(toast, title, body, level, count, now, ms)
+                return
         try:
             toast = Toast(title, body, level, on_click)
         except Exception:
             return
+        toast._t_last = now
+        toast._t_key = key
+        toast._t_count = count
         self._toasts.append(toast)
         self._layout.addWidget(toast)
         toast.show()
@@ -228,10 +280,54 @@ class ToastManager(QtWidgets.QWidget):
         self.show()
         self._reposition()
 
-        # 超龄自动淡出销毁；若期间已被挤掉则 _toasts 中查不到，直接跳过
-        QtCore.QTimer.singleShot(
-            max(int(ms), 0), lambda: self._expire_toast(toast)
-        )
+        # 超龄自动淡出销毁；若期间已被挤掉则 _toasts 中查不到，直接跳过。
+        # 计时器挂在 toast 上：同类合并（_update_merged_body）时用同一个
+        # 计时器滚动重置，避免旧 singleShot 在合并窗口内把 still-live
+        # 的新计次中途淡出掉。
+        timer = QtCore.QTimer(toast)
+        timer.setSingleShot(True)
+        timer.timeout.connect(lambda: self._expire_toast(toast))
+        toast._t_expire_timer = timer
+        timer.start(max(int(ms), 0))
+
+    def _find_toast(
+        self, key: tuple[str | None, str, str]
+    ) -> Toast | None:
+        """按 key 找当前仍存活的最新一条 Toast（合并计次写入它）。"""
+        for toast in reversed(self._toasts):
+            if getattr(toast, "_t_key", None) == key:
+                return toast
+        return None
+
+    def _update_merged_body(
+        self,
+        toast: Toast,
+        title: str,
+        body: str,
+        level: str,
+        count: int,
+        now: float,
+        ms: int,
+    ) -> None:
+        """把同类重复计次合并进现存 Toast 文本，并滚动重置其超时。"""
+        try:
+            toast.stop_fade()
+            merged_body = f"{body}\n（同类已合并 {count} 条）"
+            toast._update_text(title, merged_body)
+            toast._t_last = now
+            toast._t_count = count
+            toast.fade_in()
+            toast.update()
+            # 计次合并算「同类有活动」：滚动重置过期时刻（同一个计时器
+            # 上 start() 会取消尚未触发的计时），保证在合并窗口内持续重复
+            # 不会中途被旧的计时淡出。
+            timer = getattr(toast, "_t_expire_timer", None)
+            if timer is not None:
+                timer.start(max(int(ms), 0))
+            self.adjustSize()
+            self._reposition()
+        except Exception:
+            pass
 
     def _expire_toast(self, toast: Toast) -> None:
         if toast not in self._toasts:

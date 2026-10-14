@@ -12,6 +12,7 @@ Tab3 策略控制台：左侧实时价差图（常驻可见，无需切页），
 from __future__ import annotations
 
 import datetime as dt
+import functools
 import threading
 import time
 from typing import NamedTuple
@@ -231,38 +232,295 @@ class _MoneyDelegate(QtWidgets.QStyledItemDelegate):
 _NUM_ROLE = QtCore.Qt.ItemDataRole.UserRole + 1   # 数值排序键（EditRole 会被 Qt 转字符串）
 
 
-class _SortItem(QtWidgets.QTableWidgetItem):
-    """可排序单元格：数值列按 UserRole 存的 float 键比较，其余按显示文本。
-    （坑：覆写 __lt__ 不可调 super().__lt__（递归爆栈）；EditRole 存 float 会被
-     Qt QString 化 —— 所以用 UserRole。）"""
+class _SpreadTableModel(QtCore.QAbstractTableModel):
+    """MiniTable 的数据模型（数据/视图分离）：list[dict] 行 + ColumnSpec 列。
 
-    def __lt__(self, other: QtWidgets.QTableWidgetItem) -> bool:  # noqa: N802
-        a = self.data(_NUM_ROLE)
-        b = other.data(_NUM_ROLE)
-        if a is not None and b is not None:
-            try:
-                return float(a) < float(b)
-            except (TypeError, ValueError):
-                pass
-        return self.text() < other.text()
+    原 QTableWidget 版散落在 _make_item / _SortItem / _MoneyDelegate 的
+    职责全部并入本 model：
+    - DisplayRole：同一取文规则（money ``f"{raw:+,.2f}"``、其它浮点走
+      _fmt_value 禁科学计数法、None/缺键 -> "-"）；
+    - TextAlignmentRole：按列 kind（数字/time 右+竖中、sym 左、enum 中）；
+    - FontRole：数字列 Consolas（与原 _make_item 的 setFont 一致）；
+    - ToolTipRole：整行 tooltip（row["_tooltip"]）；
+    - ForegroundRole：money 列三态（正 #16c784 / 负 #ea3943 / 零 #8b93a3）。
+      选型：配色并入模型而非保留 _MoneyDelegate —— 着色判定与显示文本同源
+      （见 _money_color），update_cell/set_rows 发 dataChanged 后颜色随行值
+      自动刷新，不需要按列挂 delegate；
+    - UserRole+1（复用 _NUM_ROLE）：数值列返回 float，作为 sort() 排序键。
 
-
-class MiniTable(QtWidgets.QTableWidget):
-    """轻量表：list[dict] 填充 + 列规格 + 表头点击排序 + 宽度自适应铺满。
-
-    - 列宽默认按 ColumnSpec.width 比例分配，且【始终填满视口宽度】
-      （右侧不留空白）；用户拖动某列时：该列保留拖动宽度，其余列按
-      比例伸缩继续铺满。
-    - 行 dict 可带 "_tooltip" 键 → 该行所有单元格的悬浮提示。
+    定序口径与原 _SortItem.__lt__ 相同：数值列双方都有 float 键时按数值比，
+    否则退化到显示文本比较（见 _spread_row_cmp）。
     """
 
     def __init__(self, columns: list[ColumnSpec], parent=None) -> None:
-        super().__init__(0, len(columns), parent)
+        super().__init__(parent)
+        self.specs = list(columns)
+        self._rows: list[dict] = []
+        # 排序状态由视图表头点击驱动（MiniTable._on_header_clicked）；
+        # set_rows 复用同一状态保证「用户点过表头 -> 填充后维持其排序」。
+        self._sort_active = False
+        self._sort_col = 0
+        self._sort_asc = True
+
+    # ------------------------------------------------------------------
+    # Qt model 接口
+    # ------------------------------------------------------------------
+    def rowCount(self, parent=QtCore.QModelIndex()) -> int:  # noqa: N802
+        return 0 if parent.isValid() else len(self._rows)
+
+    def columnCount(self, parent=QtCore.QModelIndex()) -> int:  # noqa: N802
+        return 0 if parent.isValid() else len(self.specs)
+
+    def headerData(self, section, orientation,
+                   role=QtCore.Qt.ItemDataRole.DisplayRole):  # noqa: N802
+        if (orientation == QtCore.Qt.Orientation.Horizontal
+                and role == QtCore.Qt.ItemDataRole.DisplayRole
+                and 0 <= section < len(self.specs)):
+            return self.specs[section].title
+        return None
+
+    def data(self, index, role=QtCore.Qt.ItemDataRole.DisplayRole):  # noqa: N802
+        if not index.isValid():
+            return None
+        row = self._rows[index.row()]
+        spec = self.specs[index.column()]
+        raw = row.get(spec.key)
+        if role == QtCore.Qt.ItemDataRole.DisplayRole:
+            return self._display_text(row, spec)
+        if role == QtCore.Qt.ItemDataRole.TextAlignmentRole:
+            return self._alignment(spec)
+        if role == QtCore.Qt.ItemDataRole.FontRole:
+            return (
+                QtGui.QFont(_MONO_FONT)
+                if spec.kind in ("int", "px", "money", "pct") else None
+            )
+        if role == QtCore.Qt.ItemDataRole.ToolTipRole:
+            return row.get("_tooltip") or None
+        if role == QtCore.Qt.ItemDataRole.ForegroundRole:
+            return self._money_brush(raw, spec)
+        if role == _NUM_ROLE:
+            return self._num_key(raw, spec)
+        return None
+
+    # ------------------------------------------------------------------
+    # 数据填充 / 排序 / 就地更新
+    # ------------------------------------------------------------------
+    def set_rows(self, rows: list[dict]) -> None:
+        """全量替换行（beginResetModel/endResetModel，一次模型 reset）。
+
+        公开语义与旧 QTableWidget 版 set_rows 一致：
+        - rows 即新数据（列表顺序 = 展示顺序）；
+        - 用户点过表头（_sort_active）-> 填充后维持该排序，否则保持写入顺序。"""
+        self.beginResetModel()
+        try:
+            self._rows = list(rows)
+            if self._sort_active:
+                self._reorder_rows()
+        finally:
+            self.endResetModel()
+
+    def sort(self, col: int, order=QtCore.Qt.SortOrder.AscendingOrder) -> None:  # noqa: N802
+        """按列排序：数值列按 _NUM_ROLE 的 float，文本列/退化按显示文本。
+
+        升降序由 MiniTable._on_header_clicked 传入（同列点击切换、换列回到
+        升序的语义在视图层），本方法不自行推导方向。"""
+        if not 0 <= col < self.columnCount():
+            return
+        self._sort_col = col
+        # PySide6 枚举不与 int 相等比较（升序==0 为 False）：纵容枚举/int 双入参
+        o_value = order.value if isinstance(order, QtCore.Qt.SortOrder) else int(order)
+        self._sort_asc = int(o_value) == 0   # Qt: Ascending=0
+        self._sort_active = True
+        self.beginResetModel()
+        try:
+            self._reorder_rows()
+        finally:
+            self.endResetModel()
+
+    def update_cell(self, symbol: str, col_key: str, value,
+                    text: str | None = None) -> bool:
+        """就地更新一格（_update_leg_quotes 实时报价路径），不发整表 reset。
+
+        触发该格 dataChanged，视图/委托按需重取各 role。
+
+        :param symbol: 行定位（row["symbol"]，与 row_by_symbol 同口径）
+        :param col_key: 列定位（ColumnSpec.key）
+        :param value: 原始值（直接进模型 —— DisplayRole/_NUM_ROLE 排序键/
+            money 着色都从它派生）
+        :param text: 传参时作为 Display 覆盖文本（旧 ``setText(f"{bid:.5f}")``
+            的固定位数格式无法从 value 反推 -> 存 "_display:{key}" 旁路键）
+        :returns: 找到行并更新为 True，行或列不存在为 False
+        """
+        col = next((i for i, s in enumerate(self.specs) if s.key == col_key), None)
+        if col is None:
+            return False
+        r = next(
+            (i for i, row in enumerate(self._rows) if row.get("symbol") == symbol),
+            None,
+        )
+        if r is None:
+            return False
+        self._rows[r][col_key] = value
+        if text is not None:
+            self._rows[r][f"_display:{col_key}"] = text
+        idx = self.index(r, col)
+        self.dataChanged.emit(idx, idx)
+        return True
+
+    def row_by_symbol(self, symbol: str) -> int | None:
+        """品种 -> 当前行号（排序态下行号会变，调用方不应跨帧缓存）。"""
+        for i, row in enumerate(self._rows):
+            if row.get("symbol") == symbol:
+                return i
+        return None
+
+    def display_text(self, r: int, c: int) -> str:
+        """供 _auto_fit_columns 计宽（等价旧 item(r, c).text()）。"""
+        return self._display_text(
+            self._rows[r], self.specs[c]
+        )
+
+    # ------------------------------------------------------------------
+    # 取文 / 对齐 / 着色 / 排序键（与原 _make_item / _SortItem 同一规则）
+    # ------------------------------------------------------------------
+    def _display_text(self, row: dict, spec: ColumnSpec) -> str:
+        """DisplayRole 文本；update_cell 存的 "_display:{key}" 覆盖优先
+        （对应旧 setText 路径），其余走与 _make_item 一致的取文规则。"""
+        override = row.get(f"_display:{spec.key}")
+        if isinstance(override, str):
+            return override
+        return _fmt_value(row.get(spec.key), spec)
+
+    @staticmethod
+    def _alignment(spec: ColumnSpec) -> QtCore.Qt.AlignmentFlag:  # noqa: N805
+        kind = spec.kind
+        if kind == "sym":
+            return (
+                QtCore.Qt.AlignmentFlag.AlignLeft
+                | QtCore.Qt.AlignmentFlag.AlignVCenter
+            )
+        if kind in ("int", "px", "money", "pct", "time"):
+            return (
+                QtCore.Qt.AlignmentFlag.AlignRight
+                | QtCore.Qt.AlignmentFlag.AlignVCenter
+            )
+        if kind == "enum":
+            return QtCore.Qt.AlignmentFlag.AlignCenter
+        return (
+            QtCore.Qt.AlignmentFlag.AlignLeft
+            | QtCore.Qt.AlignmentFlag.AlignVCenter
+        )
+
+    @staticmethod
+    def _money_brush(raw, spec: ColumnSpec) -> QtGui.QBrush | None:  # noqa: N805
+        """money 三态着色（与原 _MoneyDelegate 一致：按显示文本前缀判定）。"""
+        if spec.kind != "money":
+            return None
+        text = _fmt_value(raw, spec)
+        if text.startswith("+"):
+            color = _C_MONEY_UP
+        elif text.startswith("-"):
+            color = _C_MONEY_DOWN
+        else:
+            color = _C_MONEY_ZERO
+        return QtGui.QBrush(QtGui.QColor(color))
+
+    @staticmethod
+    def _num_key(raw, spec: ColumnSpec) -> float | None:  # noqa: N805
+        """数值排序键（等价原 item.setData(_NUM_ROLE, float)）；其余 None。"""
+        if spec.kind not in ("int", "px", "money", "pct"):
+            return None
+        if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+            return float(raw)
+        return None
+
+    def _reorder_rows(self) -> None:
+        """按 _sort_col/_sort_asc 重排（stable sort + cmp_to_key，
+        升序/降序用带符号比较而非 reverse，保证等值键保持稳定序）。"""
+        spec = self.specs[self._sort_col]
+        sign = 1 if self._sort_asc else -1
+
+        def key(row: dict):
+            return _spread_row_key(row, spec, self)
+
+        order = functools.cmp_to_key(
+            lambda a, b: sign * _spread_row_cmp(a, b)
+        )
+        self._rows.sort(key=lambda row: order(key(row)))
+
+
+def _spread_row_key(row: dict, spec: ColumnSpec, model) -> tuple:
+    """(数值键, 标记) —— 数值键 float；model 参与取覆盖文本（排序应比较
+    update_cell 后的最新显示值，与旧 sortItems 基于 item.text() 一致）。"""
+    return (
+        _SpreadTableModel._num_key(row.get(spec.key), spec),
+        model._display_text(row, spec),
+    )
+
+
+def _spread_row_cmp(a: tuple, b: tuple) -> int:
+    """与原 _SortItem.__lt__ 同口径：< 0 / > 0 / 0 三向比较。
+    数值键双方都在 -> float 比较；否则退化显示文本。"""
+    ka, kb = a[0], b[0]
+    if ka is not None and kb is not None:
+        if ka < kb:
+            return -1
+        if ka > kb:
+            return 1
+        return 0
+    ta, tb = a[1], b[1]
+    if ta < tb:
+        return -1
+    if ta > tb:
+        return 1
+    return 0
+
+
+def _fmt_value(value, spec: ColumnSpec | None = None) -> str:
+    """通用格式化：money 列带千分位带符号，其余浮点禁科学计数法。"""
+    if value is None:
+        return "-"
+    if spec is not None and spec.kind == "money" \
+            and isinstance(value, (int, float)) and not isinstance(value, bool):
+        return f"{value:+,.2f}"
+    if isinstance(value, float):
+        text = f"{value:.12f}".rstrip("0").rstrip(".")
+        return text if text else "0"
+    return str(value)
+
+
+class MiniTable(QtWidgets.QTableView):
+    """轻量表（QTableView + _SpreadTableModel）：list[dict] 填充 + 列规格 +
+    表头点击排序 + 宽度自适应铺满。
+
+    - 数据/视图分离：行数据在 _SpreadTableModel，视图只管列宽/选择/观感。
+    - 列宽默认按 ColumnSpec.width 比例分配，且【始终填满视口宽度】
+      （右侧不留空白）；用户拖动某列时：该列保留拖动宽度，其余列按
+      比例伸缩继续铺满。
+    - 行 dict 可带 "_tooltip" 键 → 该行所有单元格的悬浮提示。"""
+
+    def __init__(self, columns: list[ColumnSpec], parent=None) -> None:
+        super().__init__(parent)
         self._cols = list(columns)
-        self.setHorizontalHeaderLabels([c.title for c in self._cols])
+        self._model = _SpreadTableModel(self._cols, self)
+        self.setModel(self._model)
         self.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
         self.verticalHeader().setVisible(False)
         self.setAlternatingRowColors(True)   # 斑马纹（QSS alternate-background-color）
+        # 样式对齐（全局 QSS 只命中 QTableWidget 选择器，QTableView 需要
+        # 把原有规则按同一 token 复刻到本控件；色值/规则与 theme.DARK_QSS 一字同）
+        self.setStyleSheet(
+            "QTableView {"
+            f" background-color: {COLORS['BG_TABLE']};"
+            f" alternate-background-color: {COLORS['ZEBRA']};"
+            f" gridline-color: {COLORS['GRID']};"
+            f" border: 1px solid {COLORS['BORDER']};"
+            " selection-background-color: #24344d;"
+            f" selection-color: {COLORS['TXT_PRIMARY']};"
+            " }"
+            "QTableView::item:hover { background-color: #1c2736; }"
+            "QTableView QHeaderView { border: none; }"
+        )
         header = self.horizontalHeader()
         header.setSectionResizeMode(QtWidgets.QHeaderView.Interactive)  # 用户可拖动调宽
         header.setStretchLastSection(False)
@@ -273,36 +531,44 @@ class MiniTable(QtWidgets.QTableWidget):
         header.sectionResized.connect(self._on_section_resized)
         for c, w in enumerate(self._base):
             header.resizeSection(c, w)
-        money_cols = {i for i, c in enumerate(self._cols) if c.kind == "money"}
-        if money_cols:
-            self.setItemDelegate(_MoneyDelegate(money_cols, self))
         # 排序完全自管：不启用 setSortingEnabled（它一开就按指示器重排，
         # 会破坏"写入顺序默认展示 + 用户点表头才排序"的语义）。
-        # 用 sectionClicked -> 自己维护指示器与 sortItems。
+        # 表头点击 -> sectionClicked -> model sort（数值列按 UserRole+1 float）。
         self.setSortingEnabled(False)
-        self._sort_active = False
-        self._sort_col = 0
-        self._sort_asc = True
         header.sectionClicked.connect(self._on_header_clicked)
+
+    # ------------------------------------------------------------------
+    # 兼容层：rowCount / columnWidth / setUpdatesEnabled / set_rows
+    # （columnWidth/setUpdatesEnabled 是 QTableView 原生 API，rowCount 转给 model）
+    # ------------------------------------------------------------------
+    def rowCount(self) -> int:
+        """兼容旧调用（QTableView 无此公开方法，转给 model）。"""
+        return self._model.rowCount()
+
+    def set_rows(self, rows: list[dict]) -> None:
+        """全表填充（用户点过表头 -> 保持其排序，语义在 model.set_rows）。"""
+        self._model.set_rows(rows)
+        self._distribute()
 
     def _on_header_clicked(self, col: int) -> None:
         """用户点击表头：同列再点切换升/降序；切换列回到升序；随即排序。"""
-        if self._sort_active and self._sort_col == col:
-            self._sort_asc = not self._sort_asc
+        m = self._model
+        if m._sort_active and m._sort_col == col:
+            m._sort_asc = not m._sort_asc
         else:
-            self._sort_col = col
-            self._sort_asc = True
-        self._sort_active = True
+            m._sort_col = col
+            m._sort_asc = True
+        m._sort_active = True
         self.horizontalHeader().setSortIndicator(
             col,
             QtCore.Qt.SortOrder.AscendingOrder
-            if self._sort_asc
+            if m._sort_asc
             else QtCore.Qt.SortOrder.DescendingOrder,
         )
-        self.sortItems(
+        m.sort(
             col,
             QtCore.Qt.SortOrder.AscendingOrder
-            if self._sort_asc
+            if m._sort_asc
             else QtCore.Qt.SortOrder.DescendingOrder,
         )
 
@@ -320,7 +586,6 @@ class MiniTable(QtWidgets.QTableWidget):
     def _auto_fit_columns(self) -> None:
         """列宽自适应：列宽不应小于表头 / 单元格光学宽度（中文按主题字体、
         数字按 Consolas 计宽）+ padding；开用户拖动时基准取 max(用户调整, 内容)"""
-        from PySide6 import QtCore as _qc
         from PySide6 import QtGui as _qg
         fm_text = _qg.QFontMetrics(self.font())
         fm_mono = _qg.QFontMetrics(_qg.QFont("Consolas"))
@@ -329,12 +594,12 @@ class MiniTable(QtWidgets.QTableWidget):
         cell_pad = 18     # 单元格 padding
         for c, spec in enumerate(self._cols):
             w = hdr_fm.horizontalAdvance(spec.title) + header_pad
-            for r in range(self.rowCount()):
-                item = self.item(r, c)
-                if item is None:
-                    continue
+            for r in range(self._model.rowCount()):
                 fm = fm_mono if spec.kind in ("int", "px", "money", "pct") else fm_text
-                w = max(w, fm.horizontalAdvance(item.text()) + cell_pad)
+                w = max(
+                    w,
+                    fm.horizontalAdvance(self._model.display_text(r, c)) + cell_pad,
+                )
             self._base[c] = max(self._base[c], min(w, 600))
         self._distribute()
 
@@ -372,62 +637,6 @@ class MiniTable(QtWidgets.QTableWidget):
                         self.setColumnWidth(c, self._base[c])
         finally:
             self._filling = False
-
-    def set_rows(self, rows: list[dict]) -> None:
-        # 排序关闭 -> 填充 -> 恢复（用户点过表头才重新排序，否则保持写入顺序）
-        self.setSortingEnabled(False)
-        self.setRowCount(len(rows))
-        for r, row in enumerate(rows):
-            tooltip = row.get("_tooltip", "")
-            for c, spec in enumerate(self._cols):
-                item = self._make_item(row.get(spec.key), spec)
-                if tooltip:
-                    item.setToolTip(tooltip)
-                self.setItem(r, c, item)
-        if self._sort_active:   # 用户点过表头 -> 维持其排序；否则保持写入顺序
-            self.sortItems(
-                self._sort_col,
-                QtCore.Qt.SortOrder.AscendingOrder
-                if self._sort_asc
-                else QtCore.Qt.SortOrder.DescendingOrder,
-            )
-
-    def _make_item(self, raw, spec: ColumnSpec) -> QtWidgets.QTableWidgetItem:
-        kind = spec.kind
-        if raw is None:
-            text = "-"
-        elif kind == "money" and isinstance(raw, (int, float)) and not isinstance(raw, bool):
-            text = f"{raw:+,.2f}"
-        elif isinstance(raw, str):
-            text = raw
-        else:
-            text = _fmt_value(raw)
-        item = _SortItem(text)
-        # 数值排序键存 UserRole（EditRole 会被 Qt 转字符串，排序比较用）
-        if kind in ("int", "px", "money", "pct") and isinstance(raw, (int, float)) \
-                and not isinstance(raw, bool):
-            item.setData(_NUM_ROLE, float(raw))
-        if kind == "sym":
-            align = QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignVCenter
-        elif kind in ("int", "px", "money", "pct"):
-            align = (
-                QtCore.Qt.AlignmentFlag.AlignRight
-                | QtCore.Qt.AlignmentFlag.AlignVCenter
-            )
-            item.setFont(QtGui.QFont(_MONO_FONT))
-        elif kind == "enum":
-            align = QtCore.Qt.AlignmentFlag.AlignCenter
-        elif kind == "time":
-            align = (
-                QtCore.Qt.AlignmentFlag.AlignRight
-                | QtCore.Qt.AlignmentFlag.AlignVCenter
-            )
-        else:
-            align = QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignVCenter
-        item.setTextAlignment(align)
-        return item
-
-
 class ArmedButton(QtWidgets.QPushButton):
     """两步确认按钮：首击进入待发态（红字"确认进场(3s)"+ beep），3s 内再击
     发 sig_fire 信号；超时自动复位。"""
@@ -1442,44 +1651,30 @@ class AccountConsole(QtWidgets.QMainWindow):
             self._apply_chart_tick(result)
 
     def _update_leg_quotes(self) -> None:
-        """腿表实时报价（bid/ask/点差）：从 _last_ticks 就地更新对应行。
-        就地更新不触发排序变动/不重进整表，4 腿 × 0.2s 开销可忽略。"""
+        """腿表实时报价（bid/ask/点差/浮盈）：走 model.update_cell 就地更新
+        （单格 dataChanged，无整表 reset；Display 覆盖文本存 _display 旁路键，
+        与旧 QTableWidgetItem.setText 固定小数格式同一视觉口径）。"""
         if not self._current_legs:
             return
-        # 品种 -> 行号（当前排序下）
-        row_by_symbol: dict[str, int] = {}
-        for r in range(self._legs_table.rowCount()):
-            item = self._legs_table.item(r, 0)
-            if item:
-                row_by_symbol[item.text()] = r
-        cols = {c.key: i for i, c in enumerate(self._legs_table._cols)}
+        model = self._legs_table.model()
+        if model is None:
+            return
         sym_pnl = getattr(self, "_sym_pnl", {})
         for leg in self._current_legs:
-            tick = self._last_ticks.get(leg["symbol"])
-            row = row_by_symbol.get(leg["symbol"])
-            if row is None:
+            sym = leg["symbol"]
+            if model.row_by_symbol(sym) is None:
                 continue
+            tick = self._last_ticks.get(sym)
             if tick is not None:
                 bid, ask = _f(tick.get("bid")), _f(tick.get("ask"))
                 pts = ask - bid
-                it = self._legs_table.item(row, cols["bid"])
-                if it:
-                    it.setText(f"{bid:.5f}")
-                    it.setData(_NUM_ROLE, bid)
-                it = self._legs_table.item(row, cols["ask"])
-                if it:
-                    it.setText(f"{ask:.5f}")
-                    it.setData(_NUM_ROLE, ask)
-                it = self._legs_table.item(row, cols["spread_pts"])
-                if it:
-                    it.setText(f"{pts:.5f}")
-                    it.setData(_NUM_ROLE, pts)
+                model.update_cell(sym, "bid", bid, text=f"{bid:.5f}")
+                model.update_cell(sym, "ask", ask, text=f"{ask:.5f}")
+                model.update_cell(sym, "spread_pts", pts, text=f"{pts:.5f}")
             # 浮盈（USD，position profit 同品种相抵口径）
-            pnl = sym_pnl.get(leg["symbol"])
-            it = self._legs_table.item(row, cols.get("fl_pnl", -1))
-            if it is not None and pnl is not None:
-                it.setText(f"{pnl:+,.2f}")
-                it.setData(_NUM_ROLE, float(pnl))
+            pnl = sym_pnl.get(sym)
+            if pnl is not None:
+                model.update_cell(sym, "fl_pnl", pnl, text=f"{pnl:+,.2f}")
 
     def _apply_chart_tick(self, result: dict) -> None:
         """数据先行：未监测也持续画实时曲线/蜡烛/统计，
