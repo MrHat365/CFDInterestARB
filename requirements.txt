@@ -1,0 +1,5 @@
+MetaTrader5>=5.0.4529
+PySide6>=6.6
+numpy>=1.26
+pyqtgraph>=0.13.7
+psutil>=5.9

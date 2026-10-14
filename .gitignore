@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+*.pyo
+.mypy_cache/
+.pytest_cache/
+.venv/
+mt5_trader/mt5_trader.db
+*.log
+.DS_Store
