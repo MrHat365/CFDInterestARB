@@ -101,8 +101,9 @@ mt5_trader/
     theme.py               暗色主题（国际惯例：绿涨 #16c784 / 红跌 #ea3943 / 灰零 #8b93a3）
     base.py                EventBridge（事件总线→Qt Signal）
 tests/                     pytest 61 用例（spreads/strategy/opportunities/db）+ 无 pytest 兜底 runner
-mt5_trader/mt5_trader.db   SQLite 数据文件（gitignore，不入库）
-paused_migration/          DearPyGui 迁移尝试的归档（已弃用，仅存档）
+```
+
+本地私有文件（**不入库**，已 .gitignore）：`mt5_trader/mt5_trader.db`(SQLite 数据) 、`paused_migration/`(DearPyGui 迁移归档，已弃用仅本地备查)、`.pi/`(本地工具产物)。
 ```
 
 ## 快速开始

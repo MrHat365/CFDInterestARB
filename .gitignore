@@ -9,3 +9,5 @@ mt5_trader/mt5_trader.db
 .DS_Store
 mt5_trader/mt5_trader.db-shm
 mt5_trader/mt5_trader.db-wal
+.pi/
+paused_migration/
