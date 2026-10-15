@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 
 from mt5_trader.strategy import SignalEngine, SpreadSeries, StrategyRunner
 
@@ -231,11 +230,10 @@ def test_on_spread_grid_progression():
     eng = SignalEngine("s1", k=2.0, grid_step=0.5, levels=3)
     sig0 = eng.on_spread(_stats(2.1), ts=1.0)
     assert sig0["level"] == 2.0
-    # 网格阈值是进场门槛：每次 z 超过最低门槛即新增一笔（level 均为 k*std 基准层），
-    # 同方向计数递增
+    # Each occupied layer raises the next entry threshold by grid_step.
     sig1 = eng.on_spread(_stats(2.6), ts=2.0)
     assert sig1["action"] == "open"
-    assert sig1["level"] == 2.0
+    assert sig1["level"] == 2.5
     assert sig1["count"] == 2
 
 

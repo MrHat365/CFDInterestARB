@@ -7,6 +7,7 @@ from pathlib import Path
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from ..accounts import AccountsStore
+from ..connection_state import Phase
 from ..constants import EVENT_STATUS
 from ..database import Database
 from ..event_engine import EventEngine
@@ -55,11 +56,12 @@ class AccountsView(QtWidgets.QWidget):
     console_requested = QtCore.Signal(dict)
 
     def __init__(self, event_engine: EventEngine, store: AccountsStore,
-                 db: Database, parent=None) -> None:
+                 db: Database, sessions, parent=None) -> None:
         super().__init__(parent)
         self._ee = event_engine
         self._store = store
         self._db = db
+        self._sessions = sessions
         self._consoles: dict[str, AccountConsole] = {}
         self._scan_thread: TerminalScanThread | None = None
 
@@ -75,7 +77,9 @@ class AccountsView(QtWidgets.QWidget):
         btn_edit.clicked.connect(self._edit_selected)
         btn_scan = QtWidgets.QPushButton("扫描 MT5 客户端")
         btn_scan.clicked.connect(self._scan_terminals)
-        for b in (btn_add, btn_edit, btn_del, btn_scan):
+        btn_reclaim = QtWidgets.QPushButton('清理失败 worker')
+        btn_reclaim.clicked.connect(self._reclaim_selected)
+        for b in (btn_add, btn_edit, btn_del, btn_scan, btn_reclaim):
             toolbar.addWidget(b)
         toolbar.addStretch()
 
@@ -122,7 +126,7 @@ class AccountsView(QtWidgets.QWidget):
             self._table.setItem(row, 0, QtWidgets.QTableWidgetItem(login))
             self._table.setItem(row, 1, QtWidgets.QTableWidgetItem(acc["server"]))
             # 绑定终端：直接显示完整绝对路径；失效的用红色标出
-            terminal_path = acc.get("terminal_path") or "(自动/默认终端)"
+            terminal_path = acc.get("terminal_path") or "(未绑定终端)"
             exists = Path(terminal_path).exists() if acc.get("terminal_path") else True
             terminal_item = QtWidgets.QTableWidgetItem(terminal_path)
             terminal_item.setToolTip(terminal_path)
@@ -133,7 +137,8 @@ class AccountsView(QtWidgets.QWidget):
             self._table.setItem(
                 row, 3, QtWidgets.QTableWidgetItem(acc.get("terminal_data") or "-")
             )
-            status_item = QtWidgets.QTableWidgetItem("未连接")
+            session = self._sessions.get(key)
+            status_item = QtWidgets.QTableWidgetItem(session.state.message if session else "未连接")
             self._table.setItem(row, 4, status_item)
 
             # 操作列：打开控制台 + 编辑 + 删除
@@ -159,6 +164,9 @@ class AccountsView(QtWidgets.QWidget):
         if dialog.exec() != QtWidgets.QDialog.Accepted:
             return
         creds = dialog.credentials()
+        if self._store.get(creds["login"], creds["server"]) is not None:
+            QtWidgets.QMessageBox.warning(self, "账户已存在", "请使用编辑功能修改已有账户")
+            return
         self._store.add(creds)
         self._reload()
 
@@ -169,12 +177,36 @@ class AccountsView(QtWidgets.QWidget):
         acc = self._store.all()[row]
         self._edit_account(acc)
 
+    def _reclaim_selected(self) -> None:
+        row = self._current_row()
+        if row is None:
+            return
+        acc = self._store.all()[row]
+        key = f"{acc['login']}@{acc['server']}"
+        session = self._sessions.get(key)
+        if session is None or session.closed.is_set():
+            return
+        if session.state.phase not in (Phase.FAILED, Phase.STOPPING):
+            QtWidgets.QMessageBox.information(self, '清理worker', '请先断开会话，再清理未退出的worker')
+            return
+        if QtWidgets.QMessageBox.question(self, '清理失败worker',
+            f'清理 {key} 的worker（PID {session.worker_pid}）？\n只处理本程序子进程；请在终端核对在途委托。') == QtWidgets.QMessageBox.Yes:
+            self._sessions.reclaim(key)
+
     def _edit_account(self, acc: dict) -> None:
+        session = self._sessions.get(f"{acc['login']}@{acc['server']}")
+        if session and not session.closed.is_set():
+            QtWidgets.QMessageBox.warning(self, "账户使用中", "请先断开会话再编辑绑定")
+            return
         dialog = AccountDialog(self, initial=acc, terminals=self._store.terminals())
         if dialog.exec() != QtWidgets.QDialog.Accepted:
             return
         creds = dialog.credentials()
         self._store.add(creds)
+        key = f"{acc['login']}@{acc['server']}"
+        console = self._consoles.get(key)
+        if console:
+            console.close()  # reopening uses the newly saved binding
         self._reload()
 
     def _delete_selected(self) -> None:
@@ -192,7 +224,8 @@ class AccountsView(QtWidgets.QWidget):
             return
         console = self._consoles.pop(key, None)
         if console:
-            console.stop_session_and_close()
+            console.close()
+        self._sessions.disconnect(key)
         self._store.remove(acc["login"], acc["server"])
         self._reload()
 
@@ -220,7 +253,7 @@ class AccountsView(QtWidgets.QWidget):
         self._scan_thread = thread
 
         def on_found(item: dict) -> None:
-            rows = self._store.sync_terminals([item])
+            self._store.sync_terminals([item])
             label = item.get("path") or item.get("data_folder")
             if label and label not in hits:
                 hits.append(label)
@@ -266,33 +299,37 @@ class AccountsView(QtWidgets.QWidget):
         key = f"{acc['login']}@{acc['server']}"
         if key in self._consoles:
             console = self._consoles[key]
-            console.showNormal(); console.raise_(); console.activateWindow()
+            console.showNormal()
+            console.raise_()
+            console.activateWindow()
             return
         console = AccountConsole(
-            self._ee, acc, self._store, self._db,
-            on_closed=lambda k=key: self._consoles.pop(k, None),
+            self._ee, acc, self._store, self._db, self._sessions,
+            on_closed=lambda k: self._consoles.pop(k, None),
         )
         self._consoles[key] = console
         console.show()
 
     def _on_status(self, event) -> None:
+        if not self._sessions.is_current(event):
+            return
         key = event.data.get("session", "")
+        session = self._sessions.get(key)
+        if session is None or event.data["payload"].get("revision") != session.state.revision:
+            return
         ok = bool(event.data.get("payload", {}).get("ok"))
         mapping = self._buttons.get(key)
         if mapping:
-            row, item = mapping
-            item.setText("已连接" if ok else "未连接")
+            _row, item = mapping
+            item.setText(session.state.message)
             item.setForeground(QtGui.QColor("#5fb878") if ok else QtGui.QColor("#e05661"))
 
     def close_all_consoles(self) -> None:
         """主窗口关闭 = 全部控制台一并关闭；单个异常绝不拖垮其它窗口。"""
+        if self._scan_thread and self._scan_thread.isRunning():
+            self._scan_thread.cancel()
+            self._scan_thread.wait()
+        self._status_bridge.destroy()
         for console in list(self._consoles.values()):
-            try:
-                console.stop_session_and_close()
-            except Exception:
-                pass
-            try:
-                console.close()
-            except Exception:
-                pass
+            console.close()
         self._consoles.clear()

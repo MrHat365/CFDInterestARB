@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import os
+import sys
 import subprocess
 import time
 from pathlib import Path
@@ -35,6 +36,8 @@ _APPDATA_KEEP = {("appdata", "roaming", "metaquotes"), ("appdata", "local", "pro
 
 def _reg_enumerate_uninstall() -> dict[str, str]:
     """返回 {键名: "DisplayIcon|InstallLocation"}"""
+    if sys.platform != "win32":
+        return {}
     import winreg
 
     found: dict[str, str] = {}
@@ -72,6 +75,8 @@ def _reg_enumerate_uninstall() -> dict[str, str]:
                         found.setdefault(f"{display}#{index}", f"{icon}|{location}")
                 except OSError:
                     continue
+                finally:
+                    winreg.CloseKey(child)
         finally:
             winreg.CloseKey(key)
     return found
@@ -167,6 +172,8 @@ def scan_running_processes(timeout: float = 20) -> list[str]:
 # 全盘深度 BFS（生成器，可取消）
 # ---------------------------------------------------------------------------
 def _fixed_drives() -> list[Path]:
+    if sys.platform != "win32":
+        return []
     import ctypes
 
     drives = []

@@ -21,15 +21,16 @@ from mt5_trader.opportunities import (
 # generate() 空输入守卫
 # ---------------------------------------------------------------------------
 STOCKS = [
-    {"symbol": "EURUSD", "swap_long": 1.0, "swap_short": -1.0, "swap_mode": 2},
-    {"symbol": "USDJPY", "swap_long": 1.0, "swap_short": -1.0, "swap_mode": 2},
-    {"symbol": "EURJPY", "swap_long": 1.0, "swap_short": -1.0, "swap_mode": 2},
+    {"symbol": "EURUSD", "swap_long": 1.0, "swap_short": -1.0, "swap_mode": 4},
+    {"symbol": "USDJPY", "swap_long": 1.0, "swap_short": -1.0, "swap_mode": 4},
+    {"symbol": "EURJPY", "swap_long": 1.0, "swap_short": -1.0, "swap_mode": 4},
 ]
 RATES = {"EUR": 1.08, "JPY": 1.0 / 156.0}
 
 
 def test_generate_empty_stocks_returns_empty():
     assert generate([], RATES) == []
+    assert generate(STOCKS, RATES, should_cancel=lambda: True) == []
 
 
 def test_generate_fx_rates_none_returns_empty():
@@ -38,7 +39,7 @@ def test_generate_fx_rates_none_returns_empty():
 
 def test_generate_triangle_produces_both_directions_sorted():
     """三腿中性环（买 EURUSD + 买 USDJPY + 卖 EURJPY）两个方向都应输出，
-    且按 net_swap 降序。swap_mode=2（入金货币 USD）下 swap 即 USD/天。"""
+    且按 net_swap 降序。swap_mode=4（入金货币 USD）下 swap 即 USD/天。"""
     out = generate(STOCKS, RATES)
     assert len(out) == 2
     # 净息降序

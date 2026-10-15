@@ -8,18 +8,17 @@ swap_to_usd_per_day：按 MQL5 SYMBOL_SWAP_MODE 权威语义把单腿隔夜利�
 换算为 USD/天（1 标准手）。mode 权威取值：
     0 DISABLED          无掉期
     1 POINTS            按点
-    2 CURRENCY_DEPOSIT  按入金货币（账户货币）
-    3 CURRENCY_SYMBOL   按品种利润货币
-    4 CURRENCY_MARGIN   按保证金货币
-    5 INTEREST_CURRENT  按当前价年利率 %
-    6 INTEREST_OPEN     按开仓价年利率 %
-    7 REOPEN_CURRENT    当日重开，年利率按当前价（近似按 5 处理，见下注）
-    8 REOPEN_FIXED      次日重开，年利率按开仓价（近似按 6 处理，见下注）
-7/8 的重开价格当日不可知，本工具无法精确还原，故与 5/6 用同一近似公式；
-差异通常远小于利率本身的日间波动。
+    2 CURRENCY_SYMBOL   品种基础货币
+    3 CURRENCY_MARGIN   保证金货币
+    4 CURRENCY_DEPOSIT  账户货币
+    5 INTEREST_CURRENT  当前价年利率（FX 名义近似）
+    6 INTEREST_OPEN     开仓价年利率（需持仓开仓价，本模块不估算）
+    7/8 REOPEN          重开价格调整（不冒充年息）
 """
 
 from __future__ import annotations
+
+import math
 
 import numpy as np
 
@@ -40,7 +39,7 @@ def _usd_rate(usd_rates: dict[str, float], currency: str) -> float | None:
     if currency == "USD":
         return 1.0
     r = usd_rates.get(currency) if isinstance(usd_rates, dict) else None
-    if not isinstance(r, (int, float)) or isinstance(r, bool) or float(r) <= 0:
+    if not isinstance(r, (int, float)) or isinstance(r, bool) or not math.isfinite(float(r)) or float(r) <= 0:
         return None
     return float(r)
 
@@ -83,7 +82,11 @@ def usd_neutral_weights(
         if rb is None or rq is None:
             return None
         sign = 1.0 if side == "buy" else -1.0
-        # quote 支付量（每手，100k 基准名义）及其 USD 价值
+        contract = leg.get("contract_size", 100_000)
+        if not isinstance(contract, (int, float)) or not math.isfinite(contract) or contract <= 0:
+            return None
+        rb *= contract / 100_000
+        # Normalize by 100k; relative contract sizes still affect lot weights.
         quote_units = rb / rq               # quote 币单位（100k 名义口径）
         quote_usd = quote_units * rq        # = rb，即该腿 quote 敞口的 USD 价值
         leg_flows.append({base: sign * rb, quote: -sign * quote_usd})
@@ -127,7 +130,7 @@ def _project_min_flow(b_mat: np.ndarray) -> np.ndarray | None:
         if not active:
             return None
         sub = b_mat[:, active]
-        vt = np.linalg.svd(sub, full_matrices=False)[2]
+        vt = np.linalg.svd(sub, full_matrices=True)[2]
         v = vt[-1]
         # 定向：以绝对值最大分量为正，避免整体反号导致全列被误 clip
         pivot = int(np.argmax(np.abs(v)))
@@ -163,6 +166,8 @@ def swap_to_usd_per_day(
     if not isinstance(raw, (int, float)) or isinstance(raw, bool):
         return None
     swap = float(raw)
+    if not math.isfinite(swap):
+        return None
 
     mode = info.get("swap_mode")
     if not isinstance(mode, int) or isinstance(mode, bool):
@@ -184,16 +189,16 @@ def swap_to_usd_per_day(
         if not all(isinstance(v, (int, float)) and not isinstance(v, bool)
                    for v in (point, tick_size, tick_value)):
             return None
-        if float(tick_size) <= 0:
+        if not all(math.isfinite(float(v)) and float(v) > 0 for v in (point, tick_size, tick_value)):
             return None
-        profit_usd = rate_to_usd(info.get("currency_profit"))
-        if profit_usd is None:
+        deposit_usd = rate_to_usd(account_currency)
+        if deposit_usd is None:
             return None
-        # swap_points × tick_value ×(point/tick_size) => currency_profit 计价
-        value_profit = swap * float(tick_value) * (float(point) / float(tick_size))
-        return value_profit * profit_usd
+        # MT5 trade_tick_value is denominated in the deposit currency.
+        value_deposit = swap * float(tick_value) * (float(point) / float(tick_size))
+        return value_deposit * deposit_usd
 
-    if mode == 2:  # CURRENCY_DEPOSIT：入金/账户货币计价
+    if mode == 4:  # CURRENCY_DEPOSIT：账户货币计价
         if account_currency == "USD":
             return swap
         acc = rate_to_usd(account_currency)
@@ -201,24 +206,28 @@ def swap_to_usd_per_day(
             return None
         return swap * acc
 
-    if mode == 3:  # CURRENCY_SYMBOL：品种利润货币计价
-        profit_usd = rate_to_usd(info.get("currency_profit"))
+    if mode == 2:  # CURRENCY_SYMBOL：品种基础货币计价
+        profit_usd = rate_to_usd(info.get("currency_base"))
         if profit_usd is None:
             return None
         return swap * profit_usd
 
-    if mode == 4:  # CURRENCY_MARGIN：保证金货币计价
+    if mode == 3:  # CURRENCY_MARGIN：保证金货币计价
         margin_usd = rate_to_usd(info.get("currency_margin"))
         if margin_usd is None:
             return None
         return swap * margin_usd
 
-    if mode in (5, 6, 7, 8):
-        # INTEREST_CURRENT(5)/INTEREST_OPEN(6)；7/8=REOPEN 当日/次日重开，
-        # 重开价当日不可知，按 5/6 同式近似（见模块 docstring 注）。
-        # 价格敞口用 USD 名义近似（FX 里价格货币敞口 ≈ base 名义）。
+    if mode in (6, 7, 8):
+        # INTEREST_OPEN needs each position's open price; REOPEN modes encode
+        # price adjustments, not annual interest. Do not invent a USD/day yield.
+        return None
+
+    if mode == 5:
         contract = info.get("trade_contract_size")
         if not isinstance(contract, (int, float)) or isinstance(contract, bool):
+            return None
+        if not math.isfinite(float(contract)) or contract <= 0:
             return None
         base_usd = rate_to_usd(info.get("currency_base"))
         if base_usd is None:

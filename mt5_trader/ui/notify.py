@@ -38,16 +38,20 @@ RETCODE_NAME: dict[int, str] = {
     10021: "无有效报价",
     10022: "无效到期日",
     10023: "订单状态不允许",
-    10024: "无连接",
-    10025: "仅允许平仓",
-    10026: "交易被禁用",
-    10027: "订单数超限",
-    10028: "多头禁用",
-    10029: "空头禁用",
-    10030: "单品种持仓超限",
-    10031: "平仓量超持仓",
-    10032: "关闭全部失败",
-    10033: "已全部平仓",
+    10024: "请求过于频繁",
+    10025: "无变更",
+    10026: "服务器禁止自动交易",
+    10027: "客户端禁止自动交易",
+    10028: "请求被锁定",
+    10029: "订单或持仓冻结",
+    10030: "不支持的成交方式",
+    10031: "无连接",
+    10032: "仅真实账户可用",
+    10033: "挂单数量达到上限",
+    10034: "手数达到上限",
+    10036: "持仓已关闭",
+    10038: "平仓量超过持仓量",
+    10010: "部分成交",
 }
 
 # 级别 -> (底色, 边框/标题色)
@@ -352,7 +356,17 @@ class ToastManager(QtWidgets.QWidget):
     # ------------------------------------------------------------------
     # 事件订阅
     # ------------------------------------------------------------------
-    def notify_hook(self, event_engine: Any, session_name: str | None = None) -> None:
+    def dispose(self) -> None:
+        if getattr(self, "_engine", None):
+            for event_type, handler in self._handlers:
+                self._engine.unregister(event_type, handler)
+            self._handlers.clear()
+            self._engine = None
+        self._disposed = True
+        for toast in list(self._toasts):
+            self._dismiss_toast(toast)
+
+    def notify_hook(self, event_engine: Any, session_name: str | None = None, accept_event=None) -> None:
         """订阅 eOrderResult / eLog；session_name 非 None 时只响应该会话。
 
         先反注册上一轮 handler，允许重复调用而不产生重复 toast。
@@ -363,6 +377,8 @@ class ToastManager(QtWidgets.QWidget):
                     self._engine.unregister(event_type, handler)
                 except Exception:
                     pass
+        self._disposed = False
+        self._accept_event = accept_event
         self._engine = event_engine
         self._session_name = session_name
         self._handlers = [
@@ -377,8 +393,10 @@ class ToastManager(QtWidgets.QWidget):
                 event_engine.register(EVENT_LOG, self.log_event.emit),
             ),
         ]
-        self.order_result_event.connect(self._on_order_result)
-        self.log_event.connect(self._on_log)
+        if not getattr(self, "_slots_bound", False):
+            self.order_result_event.connect(self._on_order_result)
+            self.log_event.connect(self._on_log)
+            self._slots_bound = True
 
     # ------------------------------------------------------------------
     # 槽（Qt 主线程）
@@ -420,6 +438,11 @@ class ToastManager(QtWidgets.QWidget):
     # 内部工具
     # ------------------------------------------------------------------
     def _accept_session(self, data: Any) -> bool:
+        if getattr(self, "_disposed", False):
+            return False
+        predicate = getattr(self, "_accept_event", None)
+        if predicate and not predicate(Event("", data)):
+            return False
         if self._session_name is None:
             return True
         try:

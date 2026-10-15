@@ -11,3 +11,7 @@ mt5_trader/mt5_trader.db-shm
 mt5_trader/mt5_trader.db-wal
 .pi/
 paused_migration/
+.ruff_cache/
+build/
+dist/
+*.execution-lock

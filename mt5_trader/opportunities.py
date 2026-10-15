@@ -37,9 +37,9 @@ def parse_fx(symbol: str) -> tuple[str, str] | None:
     return None
 
 
-def build_edges(stocks: list[dict]) -> dict[str, list[tuple[str, str, str]]]:
+def build_edges(stocks: list[dict]) -> dict[frozenset[str], list[tuple[str, str, str]]]:
     """货币对 -> [(symbol, base, quote)]；同对多符号即平行边（2腿中性素材）。"""
-    edges: dict[tuple[str, str], list[tuple[str, str, str]]] = {}
+    edges: dict[frozenset[str], list[tuple[str, str, str]]] = {}
     for item in stocks:
         parsed = parse_fx(item["symbol"])
         if parsed is None:
@@ -63,7 +63,7 @@ def sides_for_cycle(cycle: list[tuple[str, str, str, str]]) -> list[tuple[str, s
                   from == quote => 卖出
     """
     out = []
-    for from_c, to_c, symbol, base in cycle:
+    for from_c, _to_c, symbol, base in cycle:
         if from_c == base:
             out.append((symbol, "buy"))
         else:
@@ -71,11 +71,10 @@ def sides_for_cycle(cycle: list[tuple[str, str, str, str]]) -> list[tuple[str, s
     return out
 
 
-def _find_cycles(edges: dict, max_len: int = 5) -> list[list[tuple[str, str, str, str]]]:
+def _find_cycles(edges: dict, max_len: int = 5, should_cancel=None) -> list[list[tuple[str, str, str, str]]]:
     """在无向多重图上枚举 2..max_len 的除首尾外节点不重复闭合路径。"""
     adj: dict[str, list[tuple[str, str, str]]] = {}
-    for pair_key, items in edges.items():
-        base, quote = tuple(pair_key)
+    for items in edges.values():
         for symbol, b, q in items:
             adj.setdefault(b, []).append((q, symbol, b))
             adj.setdefault(q, []).append((b, symbol, b))
@@ -83,10 +82,14 @@ def _find_cycles(edges: dict, max_len: int = 5) -> list[list[tuple[str, str, str
     cycles: list[list[tuple[str, str, str, str]]] = []
 
     def dfs(path) -> None:
+        if should_cancel and should_cancel():
+            return
         node = path[-1][1]
         start = path[0][0]
         depth = len(path)
         for nxt, symbol, base in adj.get(node, []):
+            if should_cancel and should_cancel():
+                return
             # 平行边允许走回上一个节点（2 腿中性：同一货币对两个符号）
             if nxt == start and depth >= 2:
                 # path[0] 是种子节点，不计入腿
@@ -104,11 +107,15 @@ def _find_cycles(edges: dict, max_len: int = 5) -> list[list[tuple[str, str, str
             dfs([*path, (node, nxt, symbol, base)])
 
     for start in sorted(adj):
+        if should_cancel and should_cancel():
+            return []
         dfs([(start, start, "", start)])
 
     # 去重：旋转/反向等价视为同一条
     unique: dict[frozenset, list] = {}
     for c in cycles:
+        if should_cancel and should_cancel():
+            return []
         key = frozenset(
             frozenset((step[0], step[1])) for step in c
         ) | frozenset(step[2] for step in c)
@@ -137,6 +144,7 @@ def generate(
     max_legs: int = 5,
     cap: int = 100,
     account_currency: str = "USD",
+    should_cancel=None,
 ) -> list[dict]:
     """stocks: [{symbol, swap_long, swap_short, swap_mode, ...}] -> 机会列表。
 
@@ -158,6 +166,8 @@ def generate(
 
     输出按净隔夜利息估计（USD/天）降序，最多返回 cap 条（默认 100）。
     """
+    if should_cancel and should_cancel():
+        return []
     stocks = [s for s in stocks if parse_fx(s.get("symbol", ""))]
     if fx_rates is None:
         return []
@@ -181,9 +191,11 @@ def generate(
                 return None
             per_leg_usd.append(swap_usd)
         w = usd_neutral_weights(
-            [{"symbol": sym, "side": side} for sym, side in legs], rates
+            [{"symbol": sym, "side": side,
+              "contract_size": symbol_map[sym].get("trade_contract_size", symbol_map[sym].get("contract_size", 100_000))}
+             for sym, side in legs], rates
         )
-        if w is None:
+        if w is None or any(weight <= 1e-9 for weight in w):
             return None
         net_swap = float(sum(wi * s for wi, s in zip(w, per_leg_usd)))
         leg_desc = [("买" if side == "buy" else "卖", sym) for sym, side in legs]
@@ -213,7 +225,9 @@ def generate(
                 {p for s, _ in legs for p in (parse_fx(s) or ())})),  # noqa: E501
         }
 
-    for cycle in _find_cycles(edges, max_len=max_legs):
+    for cycle in _find_cycles(edges, max_len=max_legs, should_cancel=should_cancel):
+        if should_cancel and should_cancel():
+            return []
         legs = sides_for_cycle(cycle)
         if len(legs) < 2 or len(legs) > max_legs:
             continue

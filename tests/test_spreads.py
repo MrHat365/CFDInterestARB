@@ -109,9 +109,9 @@ def test_synthetic_price_exclude_removes_exactly_one_leg():
     # exclude 只剔除一个品种：剔除卖腿 USDJPY -> 剩余买腿乘法合成
     assert abs(synthetic_price(SYN_PRICES, SYN_LEGS, exclude="USDJPY")
                - 0.8835 * 176.8) < 1e-9
-    # 剔除买腿 CHFJPY -> 剩 USDJPY(sell, 幂 -1) 与 USDCHF(buy)：0.8835/156.12
+    # 合成被排除买腿 CHFJPY 的价格必须为 USDJPY/USDCHF（JPY/CHF）。
     assert abs(synthetic_price(SYN_PRICES, SYN_LEGS, exclude="CHFJPY")
-               - 0.8835 / 156.12) < 1e-9
+               - 156.12 / 0.8835) < 1e-9
 
 
 # ---------------------------------------------------------------------------
@@ -167,10 +167,9 @@ def test_build_legs_from_opportunity_weights_and_volume():
         "USDJPY": {"bid": 156.12, "ask": 156.15, "bid_volume": 10.0, "ask_volume": 10.0},
         "USDCHF": {"bid": 0.8833, "ask": 0.8835, "bid_volume": 20.0, "ask_volume": 20.0},
     }
-    meta = {"USDJPY": {"min_volume": 0.01, "volume_step": 0.01}}
     legs = build_legs_from_opportunity(opportunity, quotes, layer_volume=0.12)
 
-    assert [l.symbol for l in legs] == ["USDJPY", "USDCHF"]
+    assert [leg.symbol for leg in legs] == ["USDJPY", "USDCHF"]
     # 手数系数 = |w|/max(|w|) × layer_volume，再环整到该腿步长
     assert legs[0].multiplier == 0.12          # 2/2 × 0.12
     assert legs[1].multiplier == 0.06          # 1/2 × 0.12
@@ -199,3 +198,17 @@ def test_build_legs_from_opportunity_rounds_to_volume_step():
         symbol_meta={"USDJPY": {"min_volume": 0.01, "volume_step": 0.01}},
     )
     assert legs[0].multiplier == 0.12
+
+
+def test_two_to_five_leg_currency_cycles_have_consistent_price_dimensions():
+    currencies = ['EUR', 'USD', 'JPY', 'CHF', 'AUD']
+    rates = {'EUR': 1.1, 'USD': 1., 'JPY': .006, 'CHF': 1.2, 'AUD': .65}
+    for count in range(2, 6):
+        cycle = currencies[:count]
+        legs, prices = [], {}
+        for base, quote in zip(cycle, cycle[1:] + cycle[:1]):
+            symbol = base + quote
+            legs.append({'symbol': symbol, 'side': 'buy', 'weight': 1})
+            prices[symbol] = rates[base] / rates[quote]
+        for leg in legs:
+            assert math.isclose(synthetic_price(prices, legs, leg['symbol']), prices[leg['symbol']], rel_tol=1e-12)

@@ -1,30 +1,26 @@
-"""子进程 worker：每个 MT5 账户一个进程，直接调用 mt5.xxx()。
+"""每账户一个 MT5 worker；通过本地 JSON 消息处理行情、受管交易与自动任务。
 
-与主进程的协议（multiprocessing.Queue，全部可 JSON 序列化的 dict）：
-
-请求（主 -> 子）：
-    {"action": "subscribe", "symbol": str}
-    {"action": "order",     "request": dict}   # kind: market/close/cancel
-    {"action": "deals",     "days": int}
-    {"action": "stop"}
-
-事件（子 -> 主）：
-    {"type": EVENT_XXX, "payload": ...}        # MT5 namedtuples 已转 dict
+请求由主循环分派，交易由订单线程串行执行；事件为 {type, payload} 字典。
+旧的无归属 order/spread_algo 请求仅返回拒绝，不执行交易。
 """
 
 from __future__ import annotations
 
 import copy
+import datetime as dt
 import math
 import queue as _queue
 import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, TYPE_CHECKING, ContextManager
 
 import MetaTrader5 as mt5
 
 from .constants import (
+    EVENT_AUTOMATION_STATE,
+    EVENT_MANAGED_STATE,
+    MAGIC_DEFAULT,
     EVENT_ACCOUNT,
     EVENT_DEAL,
     EVENT_LOG,
@@ -38,26 +34,18 @@ from .constants import (
     EVENT_SWAPS,
     EVENT_SYMBOLS,
     EVENT_TICK,
-    TRADE_RETCODE_DONE,
 )
 from .spreads import round_to_step
+from .managed_trading import OrderNotSent
 
-MAGIC_DEFAULT = 260100
+if TYPE_CHECKING:
+    from .managed_trading import ManagedExecutor
+    from .automated_trading import AutomationEngine
+
 
 # UI 心跳应答事件名（与 account_session 的 ping/pong 心跳协议对应；
 # 容忍其未进 constants.py：仅 worker↔UI 传输层使用，不触发其它副作用）。
 _EVENT_PONG = "ePong"
-
-# 重报价类可重试 retcode（来自 MetaTrader5 常量包）：
-# REQUOTE=10004 / PRICE_CHANGED=10020 / PRICE_OFF=10021 ——
-# 价格已变/无有效报价，重取最新 tick 重发即可，属瞬态失败。
-_REQUOTE_RETCODES = frozenset({
-    mt5.TRADE_RETCODE_REQUOTE,
-    mt5.TRADE_RETCODE_PRICE_OFF,
-    mt5.TRADE_RETCODE_PRICE_CHANGED,
-})
-_ORDER_MAX_RETRIES = 2     # 重报价最多重试次数（首次发单不计入）
-_ORDER_RETRY_BACKOFF = 0.3  # 每次重试前退避（秒）——等行情/柜台刷新报价
 
 
 def _f(v, default: float = 0.0) -> float:
@@ -65,61 +53,10 @@ def _f(v, default: float = 0.0) -> float:
     try:
         if v is None or isinstance(v, bool):
             return default
-        return float(v)
+        value = float(v)
+        return value if math.isfinite(value) else default
     except (TypeError, ValueError):
         return default
-
-
-class _SpreadTaker:
-    """价差算法执行器（模式引 vnpy SpreaderMaker/TakerAlgo，IOC 市价简化）：
-
-    顺序执行：主动腿（先吃单锁定价差）→ 成交后立即对冲被动腿（腿腿 IOC）。
-    任一腿被拒 → stage=failed 并大声报错（裸腿暴露风险），不再自动重试。
-    全部成交 → stage=done，由调用方移除。
-    """
-
-    def __init__(
-        self,
-        algoid: str,
-        legs: dict[str, float],       # {symbol: 带符号目标手数}
-        comment: str = "",
-    ) -> None:
-        self.algoid = algoid
-        self.targets = dict(legs)     # 带符号（购买为正）
-        self.comment = comment
-        self.done: dict[str, float] = {sym: 0.0 for sym in legs}
-        self.active = max(legs, key=lambda s: abs(legs[s]))
-        self.stage = "active"        # active -> hedge -> done/failed
-        self.started_ts = time.time()
-        self.stage_ts = time.time()   # 当前阶段起始（停滞告警用）
-        self.warned_stall = False
-        self.audit_due: float | None = None   # done 后裸腿复核时间（None=未排）
-        self.audited = False
-
-    def pending_hedges(self) -> dict[str, float]:
-        """已成交部分需要补的对冲量（按已成交比例逐腿对冲，防裸腿）。"""
-        done_active = abs(self.done.get(self.active, 0.0))
-        ratio = done_active / abs(self.targets.get(self.active, 1.0) or 1.0)
-        out: dict[str, float] = {}
-        for sym, target in self.targets.items():
-            if sym == self.active:
-                continue
-            remain = target - self.done.get(sym, 0.0)
-            if abs(target) > 1e-12:
-                out[sym] = remain * ratio
-            else:
-                out[sym] = remain
-        return out
-
-    def order_done(self, symbol: str, ok: bool) -> None:
-        """单腿订单回调（成功与否 + 已成交部分由调用方注入 done）。"""
-        if not ok:
-            self.stage = "failed"
-
-
-def worker_main(req_queue: Any, rep_queue: Any, config: dict) -> None:
-    """multiprocessing spawn 入口（必须为模块级函数）。"""
-    _Worker(req_queue, rep_queue, config).run()
 
 
 class _Worker:
@@ -127,8 +64,6 @@ class _Worker:
     SNAPSHOT_INTERVAL = 1.0
     ERROR_COOLDOWN = 5.0
     LINK_FAIL_LIMIT = 3          # 连续 N 次 account_info 无数据 → 判定连接丢失
-    ALGO_STALL_SECONDS = 30.0    # 价差算法阶段无回执阈值
-    ALGO_AUDIT_DELAY = 5.0       # 全部成交后 N 秒做裸腿复核（等 broker 端同步）
     RECONNECT_EVERY = 30.0       # 连接丢失后的重连尝试间隔（秒）
 
     def __init__(self, req_queue: Any, rep_queue: Any, config: dict) -> None:
@@ -149,36 +84,43 @@ class _Worker:
         # 必须串行访问，全部包在这把锁里（否则 IPC 崩溃导致子进程退出）
         self._mt5_lock = threading.RLock()
         self._swap_fingerprint: dict[str, tuple] = {}
-        self._terminal_pid: int | None = None   # 本次会话拉起的终端 PID
         # fx_rates 快照的品种名缓存 {小写: 真实名}（首次 symbols_get 后懒加载）
         self._fx_symbol_cache: dict[str, str] | None = None
         # 连接丢失检测/自动重连状态（_poll_snapshot 维护）
         self._link_lost = False
         self._link_fail_n = 0
         self._last_reconnect = 0.0
-        # 价差算法执行器状态（_start_spread_algo 维护，订单结果驱动）
-        self._algos: dict[str, _SpreadTaker] = {}
-        self._vol_step_cache: dict[str, float] = {}
-        self._algo_audits: list[_SpreadTaker] = []   # done 后等裸腿复核
-        # 订单/价差算法专用串行队列：请求主循环只入队，由 _order_loop 线程
-        # 逐条消费发单（同一时刻只有一个订单在 order_send，保持顺序化语义）
-        self._order_q: _queue.Queue = _queue.Queue()
+        self._order_q: _queue.Queue = _queue.Queue(maxsize=128)
         # 价差历史后台线程：拉取/构造不再阻塞请求主循环（订单延迟）
         # latest-wins：进行中的拉取不被打断，pending 恒为最新请求的 legs 快照
         self._hist_lock = threading.Lock()
         self._hist_evt = threading.Event()
-        self._hist_pending: list | None = None
+        self._hist_pending: dict | None = None
         self._hist_thread: threading.Thread | None = None
+        self._managed: ManagedExecutor | None = None
+        self._automation: AutomationEngine | None = None
+        self._automation_lease: ContextManager | None = None
+        self._automation_symbols: frozenset[str] = frozenset()
+        from .worker_health import WorkerHealth
+        self._health = WorkerHealth()
+        from .broker_clock import BrokerClock
+        self._clock = BrokerClock(config.get('broker_timezone', 'UTC'))
+        self._quote_max_age = float(config.get('quote_max_age', 60))
+        if not math.isfinite(self._quote_max_age) or not 5 <= self._quote_max_age <= 120:
+            raise ValueError('市场报价最大年龄必须为5至120秒')
 
     # ------------------------------------------------------------------
     # 主循环
     # ------------------------------------------------------------------
     def run(self) -> None:
-        # 连接流程（两段式：先直接 attach，失败则写凭据+拉终端自动登录）
+        # Pure attach. A separate IPC reader can stop/ping during initialize.
         if not self._connect():
+            with self._mt5_lock:
+                mt5.shutdown()
             self._send(EVENT_STATUS, {"ok": False, "msg": "会话已停止"})
             return
 
+        self._health.ready()
         poller = threading.Thread(target=self._poll_loop, daemon=True)
         poller.start()
 
@@ -205,7 +147,14 @@ class _Worker:
                 continue
             poll_fail = 0
 
-        self._hist_evt.set()   # 唤醒历史线程以便其检测 stop 并退出
+        self.request_stop()
+        # An accepted algorithm executes its passive hedges on the order thread.
+        # Do not shutdown the API between its legs. Parent enforces a hard timeout.
+        self._order_thread.join()
+        self._hist_thread.join()
+        poller.join()
+        if self._swap_watch_thread:
+            self._swap_watch_thread.join()
         self._connected = False
         with self._mt5_lock:
             try:
@@ -220,6 +169,21 @@ class _Worker:
     # ------------------------------------------------------------------
     # 连接（唯一路线：用户先在 MT5 终端里手动登录 → 账户绑定该终端 → attach）
     # ------------------------------------------------------------------
+    def request_stop(self) -> None:
+        """IPC reader may call this while the request loop is busy attaching."""
+        self._stop_evt.set()
+        self._swap_watch_evt.set()
+        self._hist_evt.set()
+
+    def _identity_matches(self, account) -> bool:
+        return (account is not None
+                and int(account.login) == int(self._config["login"])
+                and str(account.server).strip() == str(self._server).strip())
+
+    def _account_available(self, account) -> bool:
+        terminal = mt5.terminal_info()
+        return self._identity_matches(account) and terminal is not None and bool(terminal.connected)
+
     def _connect(self) -> bool:
         """连接流程（纯 attach，永不拉起终端、永不写凭据）。
 
@@ -248,9 +212,17 @@ class _Worker:
 
         last_summary = 0.0
         while not self._stop_evt.is_set():
+            self._health.mark('initialize')
+            self._send(EVENT_STATUS, {'ok': False, 'msg': f'等待终端登录 {login}@{server}'})
             with self._mt5_lock:
                 try:
-                    ok = mt5.initialize(path=path)
+                    # initialize may launch a terminal unless we verify it is running.
+                    if not self._terminal_pids_for_path(path):
+                        self._log("请先手动启动并登录绑定的 MT5 终端")
+                        if not self._wait_stop(5):
+                            return False
+                        continue
+                    ok = mt5.initialize(path=path, timeout=10000)
                 except Exception as exc:
                     self._push_error("attach", repr(exc))
                     if not self._wait_stop(15):
@@ -266,7 +238,8 @@ class _Worker:
                         return False
                     continue
                 acc = mt5.account_info()
-            if acc is not None and int(acc.login) == login:
+                available = self._account_available(acc)
+            if available:
                 self._on_connected()
                 return True
             now = time.time()
@@ -340,12 +313,21 @@ class _Worker:
             return
         action = msg.get("action")
 
-        if action == "subscribe":
+        if self._stop_evt.is_set():
+            return
+        if action == "subscriptions":
+            wanted = {str(x).strip() for x in msg.get("symbols", []) if str(x).strip()}
+            # Do not deselect Market Watch symbols belonging to the terminal user.
+            self._symbols = frozenset()
+            for symbol in wanted:
+                self._subscribe(symbol)
+            self._send(EVENT_SYMBOLS, sorted(self._symbols))
+        elif action == "subscribe":
             self._subscribe(str(msg["symbol"]))
+        elif action in ("managed_trade", "managed_snapshot", "automation"):
+            self._queue_order(msg)
         elif action == "order":
-            # 收到即入队：发单的 order_send 网络等待移到 _order_loop 线程，
-            # 请求主循环不再被阻塞（其余 action 仍同步处理）
-            self._order_q.put(msg)
+            self._push_result(False, "无归属订单入口已禁用，请使用受管策略入口", msg.get("request", {}))
         elif action == "ping":
             # UI 心跳（与 account_session 心跳协议对应）：只回 pong，无其它副作用
             self._send(_EVENT_PONG, {"ts": time.time()})
@@ -360,173 +342,30 @@ class _Worker:
         elif action == "spread_history":
             self._send_spread_history(msg)
         elif action == "spread_algo":
-            self._order_q.put(msg)   # 算法首腿发单同走订单线程（见 order 分支）
+            self._push_error("spread_algo", "旧的无归属交易接口已禁用，请使用受管策略入口")
         elif action == "stop":
-            self._stop_evt.set()
-            self._swap_watch_evt.set()
-            # 价差算法执行中不剔除（IOC 单已发，未完成对冲的裸腿必须补齐）
-            if self._algos:
-                self._log(f"注意：退出时仍有 {len(self._algos)} 个价差算法在执行，将跑完对冲阶段")
-            if msg.get("close_terminal"):
-                self._close_terminal_processes()
+            self.request_stop()
         elif action is None:
             pass   # config 首条消息（worker_pipe 握手），忽略
         else:
             self._log(f"未知请求 action={action!r}")
 
     # ------------------------------------------------------------------
-    # 价差算法执行器（模式引 vnpy SpreadTakerAlgo，IOC 市价简化）
+    # 受管订单与自动任务队列
     # ------------------------------------------------------------------
-    def _start_spread_algo(self, msg: dict) -> None:
-        """自动价差交易：GUI 传 [{symbol, side, volume(正手数，方向在 side)}]，
-        主动腿（手数最大的腿）先吃单，成交回调立即对冲其余腿
-        （vnpy take_active_leg -> hedge_passive_legs 两阶段语义）。
-        任一腿被拒 -> 停止并大声报错（防裸腿暴露永不自动重试）。"""
-        legs_cfg = msg.get("legs", [])
-        comment = str(msg.get("comment", ""))
-        if not legs_cfg:
-            self._push_error("spread_algo", "legs 为空")
-            return
-        if not self._connected:
-            self._push_error("spread_algo", "未连接，算法拒绝")
-            return
+    def _queue_order(self, msg: dict) -> None:
+        try:
+            self._order_q.put_nowait(msg)
+        except _queue.Full:
+            if msg.get("action") == "automation":
+                self._send(EVENT_AUTOMATION_STATE, {"request_id": msg.get("request_id"),
+                    "error": "任务队列已满，未接受操作，请刷新后重试"})
+                return
+            if msg.get("action") in ("managed_trade", "managed_snapshot"):
+                self._send(EVENT_MANAGED_STATE, {"ready": False, "request_id": msg.get("request_id"), "error": "订单队列已满，请核对后重试"})
+                return
+            self._send(EVENT_SPREAD_ALGO, {"algoid": "", "stage": "failed", "msg": "委托队列已满，请核对后重试"})
 
-        # 带符号目标手数（步长环整；柜台只接受步长整数倍手数）
-        targets: dict[str, float] = {}
-        for item in legs_cfg:
-            symbol = str(item.get("symbol", "")).strip()
-            side = str(item.get("side", "buy")).lower()
-            volume = _f(item.get("volume"))
-            if not symbol or volume <= 0:
-                continue
-            signed = volume if side == "buy" else -volume
-            targets[symbol] = round_to_step(signed, self._volume_step(symbol))
-        targets = {sym: v for sym, v in targets.items() if abs(v) > 1e-12}
-        if not targets:
-            self._push_error("spread_algo", "目标手数环整后全为 0")
-            return
-
-        algoid = f"ALGO-{int(time.time() * 1000) % 10**8}"
-        algo = _SpreadTaker(algoid, targets, comment)
-        self._algos[algoid] = algo
-        self._log(
-            f"[价差算法 {algoid}] 启动：主动腿 {algo.active}，"
-            f"目标手数 {targets}"
-        )
-        self._algo_event(algo, "active", f"主动腿 {algo.active} 吃单")
-        self._algo_take_active(algo)
-
-    def _algo_event(self, algo: _SpreadTaker, stage: str, msg: str) -> None:
-        self._send(EVENT_SPREAD_ALGO, {
-            "algoid": algo.algoid, "stage": stage, "msg": msg,
-        })
-
-    def _algo_take_active(self, algo: _SpreadTaker) -> None:
-        """阶段1：主动腿吃单（IOC 市价）。"""
-        symbol = algo.active
-        volume = abs(algo.targets[symbol])
-        self._log(f"[价差算法 {algo.algoid}] 主动腿 {symbol} 吃单 {volume:.2f} 手")
-        request = {
-            "kind": "market",
-            "symbol": symbol,
-            "side": "buy" if algo.targets[symbol] > 0 else "sell",
-            "volume": volume,
-            "comment": (algo.comment or "spread")[:31],
-            "algoid": algo.algoid,
-        }
-        self._handle_order(request)
-
-    def _algo_hedge_passive(self, algo: _SpreadTaker) -> None:
-        """阶段2：按已成交比例对冲其余腿（vnpy hedge_passive_legs 语义）。
-        hedge 事件必须先发再发单——最后一腿的成交回调会同步触发 done，
-        事件流顺序：active -> hedge -> done。"""
-        algo.stage = "hedge"
-        algo.stage_ts = time.time()
-        algo.warned_stall = False
-        self._algo_event(algo, "hedge", "对冲指令已发出")
-        hedges = algo.pending_hedges()
-        for symbol, signed_volume in hedges.items():
-            volume = abs(signed_volume)
-            if volume <= 1e-9:
-                continue
-            self._log(
-                f"[价差算法 {algo.algoid}] 对冲腿 {symbol} "
-                f"{'买' if signed_volume > 0 else '卖'} {volume:.2f} 手"
-            )
-            request = {
-                "kind": "market",
-                "symbol": symbol,
-                "side": "buy" if signed_volume > 0 else "sell",
-                "volume": volume,
-                "comment": (algo.comment or "hedge")[:31],
-                "algoid": algo.algoid,
-            }
-            self._handle_order(request)
-
-    def _on_algo_leg_result(
-        self, algoid: str, symbol: str, request: dict, ok: bool, filled: float,
-    ) -> None:
-        """订单结果记账（成交/被拒都进入）。done 按实际成交量累计（带方向）。"""
-        algo = self._algos.get(algoid)
-        if algo is None:
-            return
-        sign = 1 if str(request.get("side")).lower() == "buy" else -1
-        if ok:
-            algo.done[symbol] += sign * abs(filled)
-            self._log(
-                f"[价差算法 {algoid}] {symbol} 成交 {abs(filled):.2f} 手 "
-                f"（累计 {algo.done[symbol]:+.2f} / 目标 {algo.targets[symbol]:+.2f}）"
-            )
-        else:
-            algo.order_done(symbol, False)   # stage=failed
-            self._algos.pop(algoid, None)
-            self._algo_event(
-                algo, "failed",
-                f"腿 {symbol} 被拒——存在裸腿暴露，请人工检查持仓！",
-            )
-            self._push_error(
-                "spread_algo", f"[{algoid}] 腿 {symbol} 执行失败，请立即人工检查持仓"
-            )
-            return
-        if all(
-            abs(algo.done.get(sym, 0.0) - target) <= max(self._volume_step(sym) / 2, 1e-9)
-            for sym, target in algo.targets.items()
-        ):
-            algo.stage = "done"
-            algo.audit_due = time.time() + self.ALGO_AUDIT_DELAY
-            algo.audited = False
-            self._algo_audits.append(algo)   # 从 active 表移除，进入复核队列
-            self._algos.pop(algoid, None)
-            self._log(f"[价差算法 {algoid}] 全部腿成交完毕（待裸腿复核）")
-            self._algo_event(algo, "done", "全部腿成交完毕（待复核）")
-            return
-        if algo.stage == "active" and abs(algo.done.get(algo.active, 0.0)) > 1e-9:
-            self._algo_hedge_passive(algo)
-
-    def _volume_step(self, symbol: str) -> float:
-        """品种手数步长（缓存 symbol_info.volume_step，零/不存在则 0.01）。"""
-        if symbol not in self._vol_step_cache:
-            with self._mt5_lock:
-                info = mt5.symbol_info(symbol)
-            step = float(info.volume_step) if info is not None else 0.01
-            self._vol_step_cache[symbol] = step if step > 0 else 0.01
-        return self._vol_step_cache[symbol]
-
-    def _close_terminal_processes(self) -> None:
-        """纯 detach：只断开 Python API 连接，绝不杀 MT5 终端进程。
-
-        本项目唯一路线 = 用户手动管理终端生命周期（登录/退出都由用户在
-        终端里操作），程序侧只负责 attach/detach。"""
-        with self._mt5_lock:
-            try:
-                mt5.shutdown()
-            except Exception:
-                pass
-        self._log("已断开接口连接（终端保持运行）")
-
-    # ------------------------------------------------------------------
-    # 交易规则 / 隔夜利息检测
-    # ------------------------------------------------------------------
     def _send_rules(self) -> None:
         with self._mt5_lock:
             raw = mt5.symbols_get()
@@ -545,16 +384,23 @@ class _Worker:
         })
 
     def _start_swap_watch(self, interval: float) -> None:
-        if self._swap_watch_thread and self._swap_watch_thread.is_alive():
-            return
-        self._swap_watch_evt.clear()
+        self._stop_swap_watch()
+        if self._swap_watch_thread:
+            self._swap_watch_thread.join()
+        cancel = threading.Event()
+        self._swap_watch_evt = cancel
+        interval = max(5.0, float(interval))
 
         def watch() -> None:
-            while not self._swap_watch_evt.is_set() and not self._stop_evt.is_set() and self._connected:
-                self._swap_scan()
-                self._swap_watch_evt.wait(interval)
+            while not cancel.is_set() and not self._stop_evt.is_set():
+                try:
+                    if self._connected and not self._link_lost:
+                        self._swap_scan()
+                except Exception as exc:
+                    self._push_error("swap_watch", repr(exc))
+                cancel.wait(interval)
 
-        self._swap_watch_thread = threading.Thread(target=watch, daemon=True)
+        self._swap_watch_thread = threading.Thread(target=watch, name="swap-watch", daemon=True)
         self._swap_watch_thread.start()
 
     def _stop_swap_watch(self) -> None:
@@ -568,7 +414,6 @@ class _Worker:
             self._push_error("symbols_get", str(mt5.last_error()))
             return
         fetched_at_s = time.time()
-        fetched_at = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(fetched_at_s))
 
         changed, all_items = [], []
         new_state: dict[str, tuple] = {}
@@ -588,6 +433,7 @@ class _Worker:
                 "tick_size": s.trade_tick_size,
                 "tick_value": s.trade_tick_value,
                 "contract_size": s.trade_contract_size,
+                "trade_contract_size": s.trade_contract_size,
                 "currency_margin": getattr(s, "currency_margin", ""),
                 "currency_deposit": getattr(s, "currency_deposit", ""),
             })
@@ -597,7 +443,7 @@ class _Worker:
 
         self._swap_fingerprint = new_state
         payload = {
-            "fetched_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "fetched_at": dt.datetime.fromtimestamp(fetched_at_s, dt.timezone.utc).isoformat(),
             "epoch": fetched_at_s,
             "first": not bool(changed) and bool(all_items),
             "changed": changed,
@@ -680,7 +526,7 @@ class _Worker:
             self._push_error("spread_history", "legs 含重复 symbol")
             return
         with self._hist_lock:
-            self._hist_pending = copy.deepcopy(legs)
+            self._hist_pending = copy.deepcopy(msg)
         self._hist_evt.set()
         self._log("历史拉取已在后台排队")
 
@@ -697,16 +543,20 @@ class _Worker:
             self._hist_evt.clear()
             while True:   # 处理 pending 直到为空（期间新请求持续覆盖）
                 with self._hist_lock:
-                    legs = self._hist_pending
+                    request = self._hist_pending
                     self._hist_pending = None
-                if legs is None:
+                if request is None:
                     break
-                self._fetch_spread_history(legs)
+                try:
+                    self._fetch_spread_history(request["legs"], request.get("request_id", ""))
+                except Exception as exc:
+                    self._send(EVENT_SPREAD_HISTORY, {"ok": False, "error": str(exc),
+                               "legs": request["legs"], "request_id": request.get("request_id", "")})
                 if self._stop_evt.is_set():
                     return
             # pending 空且 evt 可能在 clear 前被再 set：循环回去 wait 确认
 
-    def _fetch_spread_history(self, legs: list) -> None:
+    def _fetch_spread_history(self, legs: list, request_id: str = "") -> None:
         """（后台线程）执行原 _send_spread_history 的拉取与构造。
 
         旧版实现文档：合成买 USDJPY(Ask) = USDCHF Ask × CHFJPY Ask，
@@ -738,10 +588,11 @@ class _Worker:
         ):
             line = self._build_spread_dataset(legs, target_sym, tf_name, tf, count)
             if line is None:
-                return
+                raise ValueError(f"{tf_name} 历史数据不可用")
             datasets[tf_name] = line
 
         self._send(EVENT_SPREAD_HISTORY, {
+            "ok": True, "request_id": request_id,
             "datasets": datasets,
             "legs": legs,
             "fetched_at": time.time(),
@@ -751,27 +602,125 @@ class _Worker:
     # 订单/算法线程（请求主循环只入队，串行发单保持顺序化语义）
     # ------------------------------------------------------------------
     def _order_loop(self) -> None:
-        """订单/价差算法专用线程：串行消费 _order_q。
+        try:
+            self._order_service()
+        finally:
+            if self._automation_lease is not None:
+                self._automation_lease.__exit__(None, None, None)
+                self._automation_lease = None
 
-        同一时刻只有一个订单在 order_send（与旧主循环同步发单等价的
-        顺序化语义）；order_send 的网络等待不再阻塞 subscribe/rules/
-        deals/spread_history 等其余请求。stop 时退出（原有语义：stop
-        之后的排队请求不再执行）。"""
+    def _order_service(self) -> None:
+        """串行执行受管订单与自动任务，停止时取消尚未执行的排队请求。"""
+        last_publish = 0.
+        try:
+            self._ensure_automation()
+        except Exception as exc:
+            self._send(EVENT_AUTOMATION_STATE, {"error": str(exc), "running": False})
         while True:
             try:
-                msg = self._order_q.get(timeout=0.2)
+                msg = self._order_q.get(timeout=0.05)
             except _queue.Empty:
                 if self._stop_evt.is_set():
                     return
-                continue
+                msg = {}
+            if self._stop_evt.is_set():
+                self._push_error("order_loop", "退出时取消尚未执行的委托")
+                return
             try:
                 action = msg.get("action")
-                if action == "order":
-                    self._handle_order(msg["request"])
+                if action == "automation":
+                    self._handle_automation(msg)
+                elif action in ("managed_trade", "managed_snapshot"):
+                    self._handle_managed(msg)
+                elif action == "order":
+                    self._push_result(False, "无归属订单入口已禁用", msg.get("request", {}))
                 elif action == "spread_algo":
-                    self._start_spread_algo(msg)
+                    self._push_error("spread_algo", "旧的无归属算法接口已禁用")
+                # No stale per-tick trading jobs are queued. Each pass evaluates
+                # latest conditions and dispatches at most one basket.
+                if self._automation is not None:
+                    if self._order_q.empty():
+                        self._automation.pulse()  # Apply queued human controls first.
+                    if time.monotonic() - last_publish >= 1:
+                        self._send(EVENT_AUTOMATION_STATE, self._automation.view())
+                        last_publish = time.monotonic()
             except Exception as exc:
                 self._push_error("order_loop", repr(exc))
+                self._send(EVENT_SPREAD_ALGO, {"algoid": "", "stage": "failed",
+                           "msg": f"委托执行异常，结果需人工核对: {exc}"})
+            finally:
+                self._health.mark('orders')
+
+    def _ensure_managed(self):
+        from .managed_trading import ExecutionLedger, ManagedExecutor
+        if self._managed is None:
+            path = self._config.get("execution_db")
+            if not path:
+                raise ValueError("没有配置持久交易账本，拒绝实盘")
+            ledger = ExecutionLedger(path, f"{self._name}@{self._server}")
+            self._managed = ManagedExecutor(self, mt5, ledger)
+        return self._managed
+
+    def _ensure_automation(self):
+        from .automated_trading import AutomationEngine
+        if self._automation is None:
+            executor = self._ensure_managed()
+            lease = executor.ledger.exclusive()
+            lease.__enter__()
+            try:
+                self._automation = AutomationEngine(executor)
+            except Exception:
+                lease.__exit__(None, None, None)
+                raise
+            # Acquired/released on the order thread. Prevent a second worker
+            # using this ledger from running stale in-memory task switches.
+            self._automation_lease = lease
+            with self._mt5_lock:
+                for symbol in self._automation.symbols():
+                    mt5.symbol_select(symbol, True)
+            self._automation_symbols = self._automation.symbols()
+
+    def _handle_automation(self, message):
+        try:
+            self._ensure_automation()
+            assert self._automation is not None
+            self._automation.command(message)
+            self._automation_symbols = self._automation.symbols()
+            self._send(EVENT_AUTOMATION_STATE, {**self._automation.view(),
+                'request_id': message.get('request_id')})
+        except Exception as exc:
+            state = self._automation.view() if self._automation is not None else {}
+            self._send(EVENT_AUTOMATION_STATE, {**state, 'request_id': message.get('request_id'),
+                                               'error': str(exc)})
+
+    def _handle_managed(self, message: dict) -> None:
+        request_id = message.get("request_id")
+        try:
+            managed = self._ensure_managed()
+            if str(message.get('strategy_id', '')).startswith('auto:') and message['action'] == 'managed_trade':
+                raise ValueError('后台任务归属只允许通过任务执行器操作')
+            if message["action"] == "managed_trade":
+                if message.get('operation') == 'open' and self._automation is not None:
+                    limits = self._automation.account_limits(managed.snapshot())
+                    message = {**message, **{key: min(float(message.get(key, 0)), value)
+                                            for key, value in limits.items()}}
+                reply = managed.execute(message)
+                state = reply["state"]
+            else:
+                state = managed.snapshot()
+            self._send(EVENT_MANAGED_STATE, {**state, "request_id": request_id})
+        except Exception as exc:
+            state = {"ready": False, "batches": [], "blocked": True}
+            if self._managed is not None:
+                try:
+                    state = self._managed.snapshot()
+                except Exception:
+                    pass  # Preserve the original failure in the mandatory reply.
+            self._send(EVENT_MANAGED_STATE, {**state, "request_id": request_id, "error": str(exc)})
+            self._push_error("managed_trade", str(exc))
+        finally:
+            if self._automation is not None:
+                self._automation._state_at = 0.
 
     def _build_spread_dataset(self, legs, target_sym, tf_name, tf, count) -> dict | None:
         """单周期的乘法合成价差**折线**序列（用户公式）。
@@ -779,22 +728,26 @@ class _Worker:
         只在 legs 各自同时存在该时间戳时才出点（交集），
         M1 交集缺口远小于 H1（周末/结市更短），缺口更少、图更连贯。
         蜡烛已退役：只返回 {"t": [...], "v": [...]}。"""
-        with self._mt5_lock:
-            leg_ohlc: dict[str, dict[str, list]] = {}
-            for leg in legs:
+        leg_ohlc: dict[str, dict[str, list]] = {}
+        for leg in legs:
+            with self._mt5_lock:
                 rates = mt5.copy_rates_from_pos(leg["symbol"], tf, 0, count)
-                if rates is None or len(rates) == 0:
-                    self._push_error(
-                        "copy_rates", f"{leg['symbol']} {tf_name}: {mt5.last_error()}"
-                    )
-                    return None
-                ohlc = leg_ohlc[leg["symbol"]] = {k: [] for k in ("t", "o", "h", "l", "c")}
-                for r in rates:
-                    ohlc["t"].append(int(r["time"]))
-                    ohlc["o"].append(float(r["open"]))
-                    ohlc["h"].append(float(r["high"]))
-                    ohlc["l"].append(float(r["low"]))
-                    ohlc["c"].append(float(r["close"]))
+                error = mt5.last_error() if rates is None or len(rates) == 0 else None
+            if rates is None or len(rates) == 0:
+                self._push_error("copy_rates", f"{leg['symbol']} {tf_name}: {error}")
+                return None
+            # CPU conversion of history must not hold the live-order API lock.
+            ohlc = leg_ohlc[leg["symbol"]] = {k: [] for k in ("t", "o", "h", "l", "c")}
+            for r in rates:
+                try:
+                    stamp = self._clock.to_utc(r['time'])
+                except ValueError:
+                    continue  # DST-ambiguous/nonexistent bars have no unique UTC time.
+                ohlc["t"].append(stamp)
+                ohlc["o"].append(float(r["open"]))
+                ohlc["h"].append(float(r["high"]))
+                ohlc["l"].append(float(r["low"]))
+                ohlc["c"].append(float(r["close"]))
         ohlc_parts = [leg_ohlc[leg["symbol"]] for leg in legs]
         common_t = set(ohlc_parts[0]["t"])
         for part in ohlc_parts[1:]:
@@ -812,7 +765,9 @@ class _Worker:
             i for i, leg in enumerate(legs) if leg["symbol"] == target_sym
         )
         tp_part = ohlc_parts[tp_idx]
-        tp_adj = leg_adj[tp_idx]
+
+        target_sign = 1.0 if next(leg for leg in legs if leg["symbol"] == target_sym).get("side", "buy") == "buy" else -1.0
+        target_adjustment = self._spread_adj(target_sym) if target_sign > 0 else 0.0
 
         def _synth(vals: list[float]) -> float:
             """vals[i] = 该腿当前限价侧价（含点差），按 ±1 幂乘法合成。"""
@@ -820,21 +775,25 @@ class _Worker:
             for (_, pw, _adj), v in zip(comp, vals):
                 if v <= 0:
                     return float("nan")
-                s += pw * math.log(v)
-            return math.exp(s)
+                s += (-pw / target_sign) * math.log(v)
+            try:
+                return math.exp(s)
+            except OverflowError:
+                return float("nan")
 
         t_out, v_out = [], []
         for t in common_t:
             ti = idx_by_sym[tp_idx][t]
-            t_bid_c = tp_part["c"][ti]
+            t_bid_c = tp_part["c"][ti] + target_adjustment
             close_side = []
             for (pi, pw, adj) in comp:
                 i = idx_by_sym[pi][t]
                 bid = ohlc_parts[pi]["c"][i]
                 close_side.append(bid + adj if pw > 0 else bid)
             spread_c = t_bid_c - _synth(close_side)
-            v_out.append(spread_c)
-            t_out.append(t)
+            if math.isfinite(spread_c):
+                v_out.append(spread_c)
+                t_out.append(t)
         return {"t": t_out, "v": v_out}
 
     def _resolve_symbol(self, symbol: str) -> str | None:
@@ -885,84 +844,39 @@ class _Worker:
             return
         self._send(EVENT_DEAL, [d._asdict() for d in deals])
 
-    def _handle_order(self, request: dict) -> None:
-        kind = request.get("kind", "market")
-
-        if kind == "market":
-            result = self._build_market(request)
-        elif kind == "close":
-            result = self._build_close(request)
-        elif kind == "cancel":
-            result = self._build_cancel(request)
-        else:
-            self._push_result(False, f"未知订单类型: {kind}", request)
-            return
-
-        # 重报价重试：result None 或 REQUOTE/PRICE_OFF/PRICE_CHANGED 视为瞬态
-        # 失败，重取最新 tick 重发（每次前退避 _ORDER_RETRY_BACKOFF 秒）。
-        # 结构性错误（如无效手数/无品种）不在重试集内，首次失败即返回。
-        retries = 0
-        while result is None or result.retcode in _REQUOTE_RETCODES:
-            if retries >= _ORDER_MAX_RETRIES:
-                break
-            retries += 1
-            time.sleep(_ORDER_RETRY_BACKOFF)
-            # _build_market/_build_close 内部重新调用 _tick 取最新价
-            result = self._build_market(request) if kind == "market" else (
-                self._build_close(request) if kind == "close" else
-                self._build_cancel(request))
-
-        if result is None:
-            self._push_result(
-                False,
-                f"order_send 返回 None: {mt5.last_error()}"
-                + (f"（已重试 {retries} 次）" if retries else ""),
-                request,
-            )
-            self._notify_algo_failure(request)
-            return
-        if result.retcode != TRADE_RETCODE_DONE:
-            self._push_result(
-                False,
-                f"被服务器拒绝 retcode={result.retcode} comment={result.comment}"
-                + (f"（已重试 {retries} 次）" if retries else ""),
-                request,
-            )
-            self._notify_algo_failure(request)
-            return
-        self._push_result(
-            True, f"成交单号 {result.order} / {result.deal}", request
-        )
-        self._notify_algo_fill(request, _f(result.volume))
-
-    # ------------------------------------------------------------------
-    # 价差算法结果钩子（有 algoid 标记的订单回调进算法状态机）
-    # ------------------------------------------------------------------
-    def _notify_algo_fill(self, request: dict, filled: float) -> None:
-        algoid = request.get("algoid")
-        if algoid:
-            self._on_algo_leg_result(algoid, request.get("symbol", ""), request, True, filled)
-
-    def _notify_algo_failure(self, request: dict) -> None:
-        algoid = request.get("algoid")
-        if algoid:
-            self._on_algo_leg_result(algoid, request.get("symbol", ""), request, False, 0.0)
-
     # ------------------------------------------------------------------
     # 订单构造（直接拼 mt5 request）
     # ------------------------------------------------------------------
+    @staticmethod
+    def _not_sent(request, reason):
+        if request.get("_managed"):
+            raise OrderNotSent(reason)
+        return None
+
     def _build_market(self, req: dict):
+        if req.get("side", "buy") not in ("buy", "sell"):
+            return self._not_sent(req, "本地委托校验失败，未调用broker")
+        with self._mt5_lock:
+            info = mt5.symbol_info(req["symbol"])
+        volume = _f(req.get("volume"))
+        if (info is None or not info.volume_min <= volume <= info.volume_max
+                or info.volume_step <= 0
+                or abs(volume - round_to_step(volume, info.volume_step)) > 1e-8):
+            return self._not_sent(req, "本地委托校验失败，未调用broker")
         tick = self._tick(req["symbol"])
         if tick is None:
-            return None
+            return self._not_sent(req, "本地委托校验失败，未调用broker")
         side = mt5.ORDER_TYPE_BUY if req.get("side", "buy") == "buy" else mt5.ORDER_TYPE_SELL
         with self._mt5_lock:
+            if not self._account_available(mt5.account_info()):
+                self._push_error("order_identity", "账户身份不匹配或终端断线，拒绝发单")
+                return self._not_sent(req, "本地委托校验失败，未调用broker")
             return mt5.order_send({
                 "action": mt5.TRADE_ACTION_DEAL,
                 "symbol": req["symbol"],
                 "volume": float(req["volume"]),
                 "type": side,
-                "price": tick["bid"],
+                "price": tick["ask"] if side == mt5.ORDER_TYPE_BUY else tick["bid"],
                 "sl": float(req.get("sl") or 0.0),
                 "tp": float(req.get("tp") or 0.0),
                 "deviation": int(req.get("deviation", 20)),
@@ -973,33 +887,40 @@ class _Worker:
             })
 
     def _build_close(self, req: dict):
+        with self._mt5_lock:
+            positions = mt5.positions_get(ticket=int(req["ticket"]))
+        volume = _f(req.get("volume"))
+        if not positions or len(positions) != 1:
+            return self._not_sent(req, "本地委托校验失败，未调用broker")
+        position = positions[0]
+        if (position.symbol != req["symbol"]
+                or (req.get("identifier") is not None and int(position.identifier) != int(req["identifier"]))
+                or volume <= 0 or volume > position.volume
+                or req.get("side") != ("buy" if position.type == 0 else "sell")):
+            return self._not_sent(req, "本地委托校验失败，未调用broker")
         tick = self._tick(req["symbol"])
         if tick is None:
-            return None
+            return self._not_sent(req, "本地委托校验失败，未调用broker")
         # 持仓为多(POSITION_TYPE_BUY=0) -> 反向卖出
         close_side = (
             mt5.ORDER_TYPE_SELL if req.get("side", "buy") == "buy" else mt5.ORDER_TYPE_BUY
         )
         with self._mt5_lock:
+            if not self._account_available(mt5.account_info()):
+                self._push_error("order_identity", "账户身份不匹配或终端断线，拒绝发单")
+                return self._not_sent(req, "本地委托校验失败，未调用broker")
             return mt5.order_send({
                 "action": mt5.TRADE_ACTION_DEAL,
                 "position": int(req["ticket"]),
                 "symbol": req["symbol"],
                 "volume": float(req["volume"]),
                 "type": close_side,
-                "price": tick["bid"],
+                "price": tick["ask"] if close_side == mt5.ORDER_TYPE_BUY else tick["bid"],
                 "deviation": int(req.get("deviation", 20)),
                 "magic": int(req.get("magic", MAGIC_DEFAULT)),
-                "comment": "close",
+                "comment": str(req.get("comment", "close"))[:31],
                 "type_time": mt5.ORDER_TIME_GTC,
                 "type_filling": int(req.get("type_filling", mt5.ORDER_FILLING_IOC)),
-            })
-
-    def _build_cancel(self, req: dict):
-        with self._mt5_lock:
-            return mt5.order_send({
-                "action": mt5.TRADE_ACTION_REMOVE,
-                "order": int(req["ticket"]),
             })
 
     def _tick(self, symbol: str) -> dict | None:
@@ -1008,95 +929,66 @@ class _Worker:
         if raw is None:
             self._push_error("symbol_info_tick", f"{symbol}: {mt5.last_error()}")
             return None
-        return raw._asdict()
+        try:
+            result = self._clock.tick(raw._asdict())
+        except (ValueError, TypeError, OverflowError) as exc:
+            self._push_error('quote_clock', f'{symbol}: {exc}')
+            return None
+        if (not all(math.isfinite(float(result.get(k, 0))) for k in ("bid", "ask", "time"))
+                or result["bid"] <= 0 or result["ask"] < result["bid"]
+                or not -2 <= time.time() - result["time_msc"] / 1000 <= self._quote_max_age):
+            return None
+        return result
 
     # ------------------------------------------------------------------
     # 轮询
     # ------------------------------------------------------------------
     def _poll_loop(self) -> None:
         last_snapshot = 0.0
-        while not self._stop_evt.is_set() and self._connected:
+        while not self._stop_evt.is_set():
             try:
-                self._poll_ticks()
+                if not self._link_lost:
+                    self._poll_ticks()
                 now = time.monotonic()
                 if now - last_snapshot >= self.SNAPSHOT_INTERVAL:
                     self._poll_snapshot()
                     last_snapshot = now
             except Exception as exc:
                 self._push_error("poll", repr(exc))
+            finally:
+                self._health.mark('poll')
             self._stop_evt.wait(self.TICK_INTERVAL)
 
     def _poll_ticks(self) -> None:
         items = []
         with self._mt5_lock:
-            for symbol in self._symbols:
+            for symbol in self._symbols | self._automation_symbols:
                 raw = mt5.symbol_info_tick(symbol)
                 if raw is None:
                     self._push_error(f"tick({symbol})", str(mt5.last_error()))
                     continue
-                d = raw._asdict()
+                try:
+                    d = self._clock.tick(raw._asdict())
+                except (ValueError, TypeError, OverflowError) as exc:
+                    self._push_error('quote_clock', f'{symbol}: {exc}')
+                    continue
                 items.append({
                     "symbol": symbol,
                     "bid": d["bid"],
                     "ask": d["ask"],
                     "time": d["time"],
+                    "time_msc": d.get("time_msc", d["time"] * 1000),
+                    'received_at': d['received_at'],
+                    'quote_max_age': self._quote_max_age,
                 })
         if items:
             self._send(EVENT_TICK, items)
 
-    def _algo_watchdogs(self) -> None:
-        """价差算法期后巡检：阶段停滞告警 + 裸腿复核（positions 由调用者 fetch）。"""
-        now = time.time()
-        for algoid, algo in list(self._algos.items()):
-            if algo.stage in ("active", "hedge") and not algo.warned_stall:
-                stall = now - algo.stage_ts
-                if stall >= self.ALGO_STALL_SECONDS:
-                    algo.warned_stall = True
-                    self._algo_event(
-                        algo, "stalled",
-                        f"阶段 {algo.stage} 已 {stall:.0f}s 无回执，请检查订单/连接")
-                    self._push_error(
-                        "spread_algo",
-                        f"[{algoid}] {algo.stage} 阶段停滞 {stall:.0f}s，请人工介入")
-        for algo in list(getattr(self, "_algo_audits", [])):
-            if algo.audit_due is not None and now >= algo.audit_due:
-                self._algo_audits.remove(algo)
-                self._algo_leg_audit(algo)
-
-    def _algo_leg_audit(self, algo: _SpreadTaker) -> None:
-        """裸腿复核：对比 target 与 broker 实际持仓（同 symbol net）。"""
-        with self._mt5_lock:
-            positions = mt5.positions_get()
-        actual: dict[str, float] = {}
-        for p in (positions or []):
-            sign = 1 if p.type == 0 else -1     # POSITION_TYPE_BUY=0
-            sym = p.symbol
-            actual[sym] = actual.get(sym, 0.0) + sign * float(p.volume)
-        mismatches = []
-        for sym, target in algo.targets.items():
-            got = actual.get(sym, 0.0)
-            step = self._volume_step(sym)
-            if abs(got - target) > max(step / 2, 1e-9):
-                mismatches.append(f"{sym}: 目标 {target:+.2f}/实际 {got:+.2f}")
-        if mismatches:
-            algo.stage = "audit_mismatch"
-            self._algo_event(
-                algo, "audit_mismatch",
-                "裸腿不齐: " + " | ".join(mismatches))
-            self._push_error(
-                "spread_algo",
-                f"[{algo.algoid}] 裸腿复核不齐: " + " | ".join(mismatches))
-        else:
-            algo.stage = "audit_ok"
-            algo.audited = True
-            self._log(f"[价差算法 {algo.algoid}] 裸腿复核通过（对冲完全）")
-            self._algo_event(algo, "audit_ok", "裸腿复核通过（对冲完全）")
-
     def _poll_snapshot(self) -> None:
-        self._algo_watchdogs()   # 停滞告警 + 到期裸腿复核（不涉及 mt5 直调）
         with self._mt5_lock:
             acc = mt5.account_info()
-            if acc is not None:
+            if self._account_available(acc):
+                self._link_fail_n = 0
                 self._send(EVENT_ACCOUNT, acc._asdict())
                 if self._link_lost:
                     self._link_lost = False
@@ -1106,19 +998,26 @@ class _Worker:
                     self._send(EVENT_STATUS, {"ok": True, "msg": "已连接"})
             else:
                 self._link_fail_n += 1
+                if acc is not None and not self._identity_matches(acc):
+                    self._link_fail_n = self.LINK_FAIL_LIMIT
                 if not self._link_lost and self._link_fail_n >= self.LINK_FAIL_LIMIT:
                     self._link_lost = True
                     self._log(f"接口连续 {self._link_fail_n} 次无数据，判定连接丢失；进入自动重连")
                     self._send(EVENT_STATUS, {"ok": False, "msg": "连接丢失，自动重连中"})
                 self._push_error("account_info", str(mt5.last_error()))
 
-            positions = mt5.positions_get()
-            self._send(EVENT_POSITION, [p._asdict() for p in positions] if positions else [])
+            if not self._account_available(acc):
+                positions, orders = None, None
+            else:
+                positions = mt5.positions_get()
+                orders = mt5.orders_get()
+            if positions is not None:
+                self._send(EVENT_POSITION, [p._asdict() for p in positions])
             if positions is None:
                 self._push_error("positions_get", str(mt5.last_error()))
 
-            orders = mt5.orders_get()
-            self._send(EVENT_ORDER, [o._asdict() for o in orders] if orders else [])
+            if orders is not None:
+                self._send(EVENT_ORDER, [o._asdict() for o in orders])
             if orders is None:
                 self._push_error("orders_get", str(mt5.last_error()))
 
@@ -1129,7 +1028,8 @@ class _Worker:
             self._log("重连尝试: mt5.initialize …")
             with self._mt5_lock:
                 try:
-                    ok = mt5.initialize(path=path) if path else False
+                    ok = (mt5.initialize(path=path, timeout=10000)
+                          if path and self._terminal_pids_for_path(path) else False)
                     if ok:
                         acc = mt5.account_info()
                     else:
@@ -1137,7 +1037,9 @@ class _Worker:
                 except Exception as exc:
                     ok, acc = False, None
                     self._push_error("reconnect", repr(exc))
-            if ok and acc is not None:
+            with self._mt5_lock:
+                available = ok and self._account_available(acc)
+            if available:
                 self._link_lost = False
                 self._link_fail_n = 0
                 self._log(f"已重连 {acc.login}@{acc.server}")
@@ -1149,6 +1051,8 @@ class _Worker:
     # 输出
     # ------------------------------------------------------------------
     def _send(self, event_type: str, payload: Any) -> None:
+        if event_type in (EVENT_STATUS, EVENT_ACCOUNT) and isinstance(payload, dict):
+            payload = {**payload, **self._clock.metadata()}
         self._rep.put({"type": event_type, "payload": payload})
 
     def _log(self, msg: str) -> None:
@@ -1164,8 +1068,8 @@ class _Worker:
             {"source": f"MT5/{context}", "msg": msg, "level": "ERROR"},
         )
 
-    def _push_result(self, ok: bool, msg: str, request: dict) -> None:
-        self._send(EVENT_ORDER_RESULT, {"ok": ok, "msg": msg, "request": request})
+    def _push_result(self, ok: bool, msg: str, request: dict, result: dict | None = None) -> None:
+        self._send(EVENT_ORDER_RESULT, {"ok": ok, "msg": msg, "request": request, "result": result})
         self._send(
             EVENT_LOG,
             {"source": "订单", "msg": msg, "level": "INFO" if ok else "ERROR"},

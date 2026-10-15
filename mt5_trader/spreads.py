@@ -1,20 +1,9 @@
-"""价差组合核心（模式引 vnpy_spreadtrading.base.SpreadData，脱离框架自实现）。
-
-职责：
-- 用 opportunity 的带符号权重自动构建价差（不人工管理）；
-- spread bid/ask 计算：买腿取腿 bid、卖腿取腿 ask（方向取反语义同
-  vnpy SpreadData.calculate_price 的 variable_directions 翻转）；
-- 盘口可成交量 = min(各腿量 / |倍数| 环到 min_volume)（vnpy 同语义）；
-- 腿手数 ↔ 价差单位换算（calculate_leg_volume / calculate_spread_volume）；
-- 主动腿选择 + 手数环到步长。
-
-不存在 vnpy 框架依赖（TickData/ContractData 等以纯 dict/float 输入）。
-"""
+"""价差合成、报价侧选择及受管订单腿的手数步长换算。"""
 
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
 def floor_to_step(value: float, step: float) -> float:
@@ -45,111 +34,6 @@ class SpreadLeg:
     min_volume: float = 0.01
     volume_step: float = 0.01
 
-    @property
-    def signed(self) -> float:
-        return self.multiplier if self.side == "buy" else -self.multiplier
-
-
-@dataclass
-class SpreadCombo:
-    """价差组合：自动构建，盘口/量换算/主动腿全自动化。"""
-
-    legs: list[SpreadLeg]
-
-    def __post_init__(self) -> None:
-        self.leg_map: dict[str, SpreadLeg] = {l.symbol: l for l in self.legs}
-
-    # ------------------------------------------------------------------
-    # 盘口（价格 & 量）
-    # ------------------------------------------------------------------
-    def calculate_price(self) -> dict:
-        """价差盘口：bid/ask 与可成交量（逐腿方向取反 + 量取最小，语义同 vnpy）。
-
-        SELL 组合报价时：买腿收其 bid、卖腿付其 ask（即 spread.bid 按
-        vnpy 的 bid_data 语义取腿的"收价"）。
-        任何一腿 bid/ask 无效 -> 返回 {"ok": False}。
-        """
-        bid_data: dict[str, float] = {}
-        ask_data: dict[str, float] = {}
-        cap_bid = math.inf
-        cap_ask = math.inf
-
-        for leg in self.legs:
-            if leg.bid <= 0 or leg.ask <= 0 or leg.ask < leg.bid:
-                return {"ok": False, "missing": leg.symbol}
-            # 价差系数带符号（卖腿权重为负，等价 vnpy price_formula 的负系数导数）；
-            # 方向取反：卖腿在组合 bid 侧取其 ask（先卖收价），在 ask 侧取其 bid
-            if leg.side == "buy":
-                bid_data[leg.symbol] = leg.signed * leg.bid
-                ask_data[leg.symbol] = leg.signed * leg.ask
-            else:
-                bid_data[leg.symbol] = leg.signed * leg.ask
-                ask_data[leg.symbol] = leg.signed * leg.bid
-
-            # 盘口量：|倍数| 归一后向下环到最小手；卖腿 bid/ask 互换
-            m = abs(leg.multiplier) or 1.0
-            step = leg.min_volume or 0.01
-            if leg.side == "buy":
-                b_v = floor_to_step(leg.bid_volume / m, step)
-                a_v = floor_to_step(leg.ask_volume / m, step)
-            else:
-                b_v = floor_to_step(leg.ask_volume / m, step)
-                a_v = floor_to_step(leg.bid_volume / m, step)
-            cap_bid = min(cap_bid, b_v)
-            cap_ask = min(cap_ask, a_v)
-
-        bid = sum(bid_data.values())
-        ask = sum(ask_data.values())
-        return {
-            "ok": True,
-            "bid": bid,
-            "ask": ask,
-            "bid_volume": cap_bid if cap_bid != math.inf else 0.0,
-            "ask_volume": cap_ask if cap_ask != math.inf else 0.0,
-        }
-
-    # ------------------------------------------------------------------
-    # 换算
-    # ------------------------------------------------------------------
-    def leg_volume(self, symbol: str, spread_units: float) -> float:
-        """价差单位 -> 该腿手数（带方向：卖腿为负）。"""
-        return self.leg_map[symbol].signed * spread_units
-
-    def spread_units(self, symbol: str, leg_volume: float) -> float:
-        """该腿(净)手数 -> 价差单位（vnpy calculate_spread_volume 语义）。"""
-        m = self.leg_map[symbol].signed
-        if abs(m) < 1e-12:
-            return 0.0
-        return leg_volume / m
-
-    # ------------------------------------------------------------------
-    # 主动腿（先吃单的那条）
-    # ------------------------------------------------------------------
-    def pick_active_symbol(self) -> str:
-        """主动腿 = 当前点差最宽的腿（先把最贵的锁定价差，其余腿为被动对冲）。"""
-        best, best_w = "", -1.0
-        for leg in self.legs:
-            if leg.bid <= 0 or leg.ask <= 0:
-                continue
-            width = leg.ask - leg.bid
-            if width > best_w:
-                best, best_w = leg.symbol, width
-        if not best:
-            best = max(self.leg_map, key=lambda s: abs(self.leg_map[s].multiplier))
-        return best
-
-    # ------------------------------------------------------------------
-    # 目标手数（含步长环整）
-    # ------------------------------------------------------------------
-    def leg_targets(self, spread_units: float) -> dict[str, float]:
-        """给定目标价差单位 -> {symbol: 带符号目标手数（环到该腿步长）}。"""
-        out: dict[str, float] = {}
-        for leg in self.legs:
-            raw = self.leg_volume(leg.symbol, spread_units)
-            out[leg.symbol] = round_to_step(raw, leg.volume_step or 0.01)
-        return out
-
-
 def pick_target_symbol(legs: list[dict]) -> str | None:
     """组合的实际报价腿 = 卖出方向 |权重| 最大）的那条。
     价差以它计价：价差 = 实际腿 bid − 其余腿的乘法合成价。
@@ -174,16 +58,18 @@ def synthetic_price(
     **权重（手数比例）不参与定价幂**——手数管理走 SpreadLeg.multiplier；
     合成价是三角交叉面的定价偏离量（定价价差），跟手数无关。
     任一价非正 -> 返回 nan。"""
+    target_side = next((1.0 if m.get("side", "buy") == "buy" else -1.0
+                        for m in legs if m.get("symbol") == exclude), -1.0)
     s = 0.0
     for m in legs:
         sym = str(m.get("symbol", ""))
         if not sym or sym == exclude:
             continue
         p = _f(prices.get(sym), float("nan"))
-        if not (p > 0):
+        if not math.isfinite(p) or p <= 0:
             return float("nan")
         sign = 1.0 if m.get("side", "buy") == "buy" else -1.0
-        s += sign * math.log(p)
+        s += (-sign / target_side) * math.log(p)
     try:
         return math.exp(s)
     except OverflowError:
@@ -202,10 +88,10 @@ def spread_quote(prices: dict[str, float], legs: list[dict]) -> dict:
     if target is None:
         return {"ok": False, "missing": "-"}
     tp = _f(prices.get(target), float("nan"))
-    if not (tp > 0):
+    if not math.isfinite(tp) or tp <= 0:
         return {"ok": False, "missing": target}
     synth = synthetic_price(prices, legs, exclude=target)
-    if not (synth > 0):
+    if not math.isfinite(synth) or synth <= 0:
         return {"ok": False, "missing": "legs"}
     return {"ok": True, "target": target, "synthetic_ask": synth,
             "spread": tp - synth}

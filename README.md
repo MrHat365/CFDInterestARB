@@ -1,290 +1,137 @@
-# CFDInterestARB — MT5 价差套利 + 套息桌面平台
+# CFDInterestARB — MT5 价差与套息桌面工具
 
-连接 MetaTrader 5 终端的**价差套利 / 隔夜套息**交易桌面工具（PySide6 + pyqtgraph + MetaTrader5 API）。
+Python / PySide6 / pyqtgraph 桌面工具，连接 Windows MetaTrader 5 终端，展示账户、隔夜利息、外汇闭环交易机会与合成价差。图表默认纸面模式，后台实盘任务具有独立的入场/出场开关，默认均暂停。
 
-> 核心思路：把 USD 中性化的多腿组合做成一个**合成价差**，方向上"卖实际腿、买合成腿"，用价差的统计偏离（kσ 网格分层）进行小单进场；组合的**隔夜利息差**（swap）才是主要收益来源，价差收敛是入场信号。
+**当前审计修改尚未经过 Windows 运行验收。** 2026-10-15 按用户要求只进行了静态审查、代码修复和测试源码补充，没有启动应用、MT5 或执行测试。详见 [审计报告](docs/AUDIT-2026-10-15.md) 、[第二轮修复报告](docs/FOLLOWUP-2026-10-15.md) 和 [Windows 验证清单](docs/WINDOWS-VALIDATION.md)。
 
----
+## 当前能力与边界
 
-## 目录
+- 账户/终端绑定与扫描；应用级会话注册表；每账户独立 worker。
+- 连接身份以 login+server 校验，终端须已由用户启动并登录；程序不提供自动登录、密码登录或终端重启功能。
+- 连接状态、订阅确认与报价新鲜度分别处理；旧会话事件和旧历史请求不能更新当前视图。
+- 合成价差折线：M1历史、H1统计先验、实时更新、窗口选择、缩放/平移、恢复跟随、十字光标、可拖阈值线。
+- 纸面网格与信号记录；手动受管开平仓；最多32个配对后台任务，各自固定买卖方向、目标层数、入场/出场条件及独立开关。**仅支持对冲账户中的FOREX合约，代码尚未通过运行验收。** 持仓层数来自实际成交账本，共享账户总手数和保证金预算。
+- 原始账户持仓/成交查询；swap变更和实际执行回执写入SQLite。
+- 策略归属以开仓成交的position_id及当前position.identifier核验；不会平人工仓。重启恢复账本，不恢复自动监测意图。未知委托只能根据明确历史证据恢复，不能凭“查不到”重发。
 
-- [核心功能](#核心功能)
-- [系统架构](#系统架构)
-- [目录结构](#目录结构)
-- [快速开始](#快速开始)
-- [使用流程（先后顺序）](#使用流程先后顺序)
-- [价差公式与口径](#价差公式与口径)
-- [策略引擎](#策略引擎run_signal)
-- [价差算法执行](#价差算法执行vnpy-spreadtakeralgo-语义)
-- [图表（v3）](#图表v3固定窗口折线)
-- [进程与线程模型](#进程与线程模型)
-- [事件总线](#事件总线)
-- [数据与持久化](#数据与持久化)
-- [测试](#测试)
-- [监控与运维指标](#监控与运维指标)
-- [安全与实盘注意事项](#安全与实盘注意事项)
-- [提交历史（里程碑）](#提交历史里程碑)
+## 环境与启动（仅 Windows）
 
----
+需要 Python 3.12+、已安装且已登录的 MT5 终端。MetaTrader5 Python API 不支持本地 macOS。依赖仍采用原仓库版本范围，本次没有更换图表库或升级生产依赖。
 
-## 核心功能
-
-| 模块 | 能力 |
-|---|---|
-| 账户管理 | MT5 终端扫描（注册表/文件系统）、账户-终端绑定、一键打开控制台；**唯一连接路线 = 用户先在 MT5 客户端手动登录 → 绑定该终端 → worker 纯 attach**（绝不拉起/重启/写凭据） |
-| 行情接入 | 每账户一个 worker 子进程，attach 到已登录终端；ticks 0.2s 轮询、账户/持仓/挂单 1s 快照；断线检测（连续 3 次无数据）→ 30s 自动重连；UI↔worker 显式心跳（5s ping / 15s 无回包判死） |
-| 隔夜利息 | 全市场 swap 指纹比对（60s 周期，变化才推送）；`swap_to_usd_per_day` 将 9 种 swap_mode 统一换算为 USD/每天 |
-| 机会发现 | 品种多重图上枚举 2~5 腿闭环；USD 中性非负权重（最小奇异向量，5% 残余容差）；每组合给出"净息 USD/天"评级 |
-| 图表 | **确定性固定窗口折线**（M1 合成收盘）：近1小时/8/24小时/3天/7天/全部 一键切换；均值/±kσ 可拖阈值线/层间网格线/1y·6m 极值线；Y 轴定点小数（**全站无科学计数法**） |
-| 策略 | Z-score 统计（H1 全窗先验 + 实时滚动窗口两段口径）；kσ 网格分层小单；每层手数 = USD 中性权重 × 统一每层名义；方向独立计数 + 最大持仓约束 |
-| 下单 | vnpy `SpreadTakerAlgo` 语义：**主动腿先吃单（IOC）→ 成交回调立即对冲被动腿**；任一腿被拒 → 立即上报（critical 弹窗）+ 30s 停滞告警 + 5s 后裸腿复核（positions 对比 targets）；REQUOTE/PRICE_OFF 类瞬态失败自动重报价重试（≤2 次）；订单在独立线程执行（不阻塞请求主循环） |
-| 屏幕 | 交易机会 / 规则·隔夜利息合并表 / 策略控制台（图表 + 持仓/成交/信号/日志四子页）；QAbstractTableModel 数据/视图分离；toast 限流合并 |
-
----
-
-## 系统架构
-
-```
-┌────────── 主进程（PySide6 Qt UI）──────────────────────────────┐
-│ app.py: Database(SQLite) + EventEngine(单分发线程, 有界队列)   │
-│ MainWindow ─ AccountsView ─ AccountConsole × N（每账户一窗）   │
-│   · EventBridge：EventEngine(后台线程) → Qt Signal(主线程)     │
-│   · 数据/视图分离：QAbstractTableModel（MiniTable 系列）        │
-│   · 重计算全部后台化：机会生成(generate) 后台线程+信号桥回填    │
-│ AccountSession：subprocess 拉起 worker 子进程                   │
-│   + 127.0.0.1 TCP JSON-lines 双向管道（req 队列/rep 读线程）    │
-│   + 心跳（5s ping / 15s 死检）+ stderr drain（防子进程写满死锁）│
-└──────────────┬────────────────────────────────────────────────┘
-               │ JSON-lines over TCP（每账户一条连接）
-┌──────────────┴──────── 子进程 worker（每账户独立）─────────────┐
-│ worker.py _Worker:                                             │
-│   主循环线程: 请求分发（subscribe/rules/deals/历史/stop/ping）  │
-│   轮询线程:   ticks(0.2s) + 快照(1s) + 断线检测/自动重连        │
-│   swap线程:   全市场 swap 指纹比对(周期可配)                    │
-│   history线程: M1(14400)+H1(9600) 拉取（latest-wins 队列）      │
-│   order线程:   订单/价差算法（串行发单 + REQUOTE 重试）         │
-│   订单执行器 _SpreadTaker: active→hedge→done 状态机+裸腿审计    │
-│   所有 mt5.* 调用统一串行于一把 RLock（API 非线程安全）          │
-└────────────────────────────────────────────────────────────────┘
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python -m pip install -r requirements.txt
+.\.venv\Scripts\python app.py
 ```
 
-依赖方向（自外向内）：`ui → services → strategy/spreads/opportunities/weights → database → constants`。UI 层不 import worker；策略/公式层不依赖 UI（可独立测试）。
+使用流程：手动登录 MT5 → 在账户管理中添加账户并绑定终端 → 打开控制台 → 等待账户连接和swap快照 → 选择组合 → 加载历史 → 开始纸面监测。
 
-## 目录结构
+账户窗口不再收集新密码，也不向 worker传递密码；编辑时可勾选删除此账户的旧密码。旧数据库字段保留兼容，未自动批量清除用户数据。编辑已有账户时登录号/服务器不变，修改终端绑定前需要先断开会话。
 
+## 生命周期
+
+- `app.py` 创建 `SessionRegistry`，按 `login@server` 管理会话；同账户重复连接重用，同终端不允许两个活跃账户worker竞争。
+- `AccountSession.start()` 在后台建立经认证的TCP连接，每次会话使用独立generation。合法状态为 disconnected / connecting / connected / reconnecting / stopping / failed。
+- 关闭控制台只关闭视图并停止监测；连接继续由应用管理。重新打开从会话快照恢复显示。
+- “断开会话”停止worker但保留视图订阅，清理结束后可重连。断线或行情过期会暂停监测，恢复后由用户重新开始。
+- 退出主窗口停止所有会话，等待在途算法、排空持久化事件，再关闭SQLite。强制退出的未知委托结果必须在终端核对。
+- 应用重启恢复账户/终端配置，不恢复“已连接”标志，也不自动恢复交易意图。
+
+心跳确认IPC存活；账户状态确认终端连接身份；数据可用还需各腿报价有效、时龄不超过15秒、腿间时间差不超过5秒。时间阈值是工程默认，需结合Windows校钟、broker和交易时段验证。
+
+## 数据与图表
+
+典型三角示例：
+
+```text
+合成买 USDJPY = USDCHF Ask × CHFJPY Ask
+价差 = USDJPY Bid − 合成买 USDJPY
 ```
-app.py                     主入口（启动 Database/EventEngine/MainWindow）
-requirements.txt           依赖清单（见下方"快速开始"）
+
+定价幂和手数权重分开。历史使用每腿bid close并用当前点差近似ask，不能当成真实历史可成交报价。H1统计覆盖取决于终端实际可用历史，不保证加载固定年份。
+
+`series_data.py` 负责有限值校验、排序、去重、同刻替换、容量上限；历史请求通过generation/request_id/legs校验后进入runner和chart。M1折线缓冲最多200,000点，容量固定；无效旧live点不会覆盖最新点。相同组合刷新历史时保留新于历史末尾的live尾部。
+
+pyqtgraph实例生命周期与widget一致，250ms合并绘制；鼠标手动缩放/平移暂停自动跟随，点击“跟随最新”或切窗口恢复。参考线更新复用对象。时间轴/十字光标显示UTC。旧K线接口仅兼容占位，当前产品是折线图。
+
+## 受管实盘与恢复
+
+手动实盘操作先设置风险上限、取消图表纸面模式并核验策略账本。自动交易使用独立的“后台自动交易”页：从当前组合新建任务，设置实际手数、目标层数、价差/成本/净息门槛、出场净利润及可选的价差/时间/亏损条件；保存后分别启用入场和出场。旧图表Z-score网格仅用于纸面观察，不再触发实盘。详见[后台自动交易说明](docs/AUTOMATION-2026-10-15.md)。
+
+自动任务不依赖控制台窗口；关闭窗口或切换组合不会停止它。图表纸面按钮及Escape不控制后台实盘任务。需要停止时使用任务开关或“全部暂停”；断开账户/退出程序停止执行，重启后恢复配置但不恢复执行开关。失效报价等待刷新，账户/成交异常暂停；未知结果不自动重试。
+
+发单路径：账户身份/对冲模式核验 → 真实层数/账户总手数/保证金预算 → 每腿IOC与broker order_check → 步长取整后的逐币种残余检查 → 提交持久订单意图 → broker调用 → 持久回执 → position_id归属核验。每腿开仓前的整个篮子使用FOREX合约大小、当前买卖侧报价检查残余，各币种不得超过最大单腿流的5%。这不是损失或回撤上限。
+
+主动腿部分成交后按实际比例缩放被动腿并再次检查取整残余；对冲不足/未知回执会阻断继续开仓。实盘层数来自确认的账本批次，不从信号条数推断。平仓只按当前策略方向的已核验持仓逐ticket执行，部分平仓后暂停，可核验后继续平剩余归属仓位。
+
+“核验策略账本”执行只读恢复。“平策略持仓…”可选择重启前留下的策略方向，无须重新生成完全相同的机会。未知发单结果只有在唯一comment、magic、品种、方向、终态历史订单和成交量都吻合时才能恢复；broker修改comment或历史缺失时保持阻断。绝不自动重发或自动接管人工仓位。
+
+`managed_requests` / `managed_batches` 保存请求去重、订单意图、回执与批次归属；`automation_tasks`保存任务配置与开关，每次实际变更使用FULL同步。worker订单线程在生命周期内持有账户执行文件锁，阻止同库同账户的第二个后台调度者；进程崩溃后锁自动释放。不同数据库副本不共享此锁，不能并行操作同一账户。
+
+旧的无归属order/spread_algo IPC请求已拒绝，避免绕过新账本和风控；内部旧算法辅助代码仍保留供迁移对照。历史未入账的仓位不自动认领。源码运行和exe运行必须使用同一份完整数据库，不能只迁移accounts表。
+
+## 模块
+
+```text
+app.py                       应用根与确定的退出顺序
 mt5_trader/
-  __init__.py
-  constants.py             EVENT_* 事件名、swap_mode 名称、MAGIC 等
-  database.py              SQLite（WAL）账户/终端/swap快照/成交持久化
-  accounts.py              AccountsStore（账户 CRUD）
-  terminals.py             MT5 终端发现（注册表+文件系统）与实例管理
-  event_engine.py          事件总线（单分发线程、有界队列、丢最旧计数）
-  account_session.py       账户会话：subprocess worker + TCP 管道 + 心跳
-  worker_pipe.py           worker 子进程入口（python -m mt5_trader.worker_pipe <port>）
-  worker.py                _Worker 主逻辑（行情/换仓/历史/算法/审计）
-  spreads.py               价差腿/组合、乘法合成价、目标腿、手数换算
-  weights.py               USD 中性权重求解（SVD/投影迭代）、swap→USD/天
-  opportunities.py         多腿闭环枚举 → 交易机会生成
-  strategy.py              StrategyRunner / SpreadSeries（先验+滚动统计）/ SignalEngine（kσ 网格）
-  services/db_service.py   EVENT_SWAPS → swap_snapshots 增量入库
-  ui/
-    main_window.py         主窗口
-    accounts_view.py       账户管理（TerminalScanThread 后台扫描）
-    account_dialog.py      新增/编辑账户
-    console.py             AccountConsole（策略控制台主界面 + 四子页）
-    chart.py               SpreadChart v3（固定窗口实时折线）
-    kpi.py                 KPI 卡片 / 状态片 / 横幅
-    notify.py              Toast 通知（同类合并 + 数量上限）
-    theme.py               暗色主题（国际惯例：绿涨 #16c784 / 红跌 #ea3943 / 灰零 #8b93a3）
-    base.py                EventBridge（事件总线→Qt Signal）
-tests/                     pytest 61 用例（spreads/strategy/opportunities/db）+ 无 pytest 兜底 runner
+  session_registry.py        应用级会话所有权、账户/终端隔离
+  connection_state.py        不可变连接状态和合法迁移
+  account_session.py         子进程/认证TCP/心跳/请求与事件代次
+  worker_pipe.py             worker传输与独立stop/ping处理
+  worker.py                  MT5连接、行情、历史、订单、成交复核
+  event_queue.py             有界队列：快照替换、关键事件背压
+  event_engine.py            事件分发与线程安全订阅
+  series_data.py             时序规范化、有界缓冲、报价新鲜度
+  managed_trading.py         持久意图/归属账本、受管开平仓、恢复与预算
+  automated_trading.py       多配对后台任务、经济门槛、独立入场/出场控制
+  strategy.py                H1先验/live统计、图表与纸面网格信号
+  spreads.py                 组合定价与手数换算
+  opportunities.py / weights.py  闭环机会、中性权重、swap换算
+  database.py / accounts.py   SQLite与账户配置
+  services/db_service.py     swap与执行回执持久化
+  ui/                        Qt账户视图、控制台、图表、通知
 ```
 
-本地私有文件（**不入库**，已 .gitignore）：`mt5_trader/mt5_trader.db`(SQLite 数据) 、`paused_migration/`(DearPyGui 迁移归档，已弃用仅本地备查)、`.pi/`(本地工具产物)。
-```
+源码SQLite沿用 `mt5_trader/mt5_trader.db`；冻结exe使用 `%LOCALAPPDATA%/CFDInterestARB/mt5_trader.db`，开启WAL。首次部署须在关闭应用后迁移完整数据库（含受管账本）；不得同时运行旧库和副本。扫描不会删除失效终端绑定。`trades` 包含 paper/signal/execution 记录；只有execution来自worker回执，仍需看ok/result，不能将信号当成交。数据库、虚拟环境与本地归档不入库。
 
-## 快速开始
+## 测试与验证
 
-### 环境要求
+已有测试与新增测试均保留。测试函数数量及静态证据见[静态检查记录](docs/static-validation.txt)，**不是通过数**。新测试覆盖状态/IPC、数据与策略、注入MT5 API、真实Qt组件、后台多任务调度与成本门槛；本次没有运行。
 
-- Windows 10/11（MetaTrader5 Python API 仅 Windows）
-- Python 3.12+（开发环境 3.14.2）
-- MetaTrader 5 终端（已安装并可登录目标账户）
-
-### 安装与启动
+Windows准备验证环境后：
 
 ```powershell
-pip install -r requirements.txt
-python app.py
+.\.venv\Scripts\python -m pip install -r requirements-dev.txt
+$env:QT_QPA_PLATFORM = "offscreen"
+.\.venv\Scripts\python -m pytest tests -q
+.\.venv\Scripts\python -m ruff check app.py mt5_trader tests
+.\.venv\Scripts\python -m mypy --ignore-missing-imports app.py mt5_trader
 ```
 
-依赖（全部轻量，无 pandas/heavy 框架）：
+已新增pyproject检查配置和CFDInterestARB.spec，但未运行任何质量工具或生产构建；源码语法通过不等于类型检查、Lint、GUI或构建通过。旧 `tests/run_smoke.py` 仅覆盖原四个纯逻辑测试模块，不代表新增回归已执行。
 
-```
-MetaTrader5>=5.0.4529    # 官方 Python API（仅 Windows）
-PySide6>=6.6             # Qt 绑定（GUI）
-numpy>=1.26              # 数值/向量化
-pyqtgraph>=0.13.7        # 图表
-psutil>=5.9              # 进程/终端发现辅助
-```
-
-### 连接流程（顺序敏感，务必按序）
-
-1. **先**在 MT5 客户端手动登录目标账户；
-2. 在「账户管理」里登记账户并**绑定**到该终端路径（扫描或手动）；
-3. 打开控制台 → worker **attach** 到已登录终端 → 校验 login 匹配；
-   （若终端当前登录的不是该账户，worker 会持续等待人工切换，永不拉起/重启终端）
-
-连接成功后：swap 首轮数据到达（约间隔 60s 更新）→ **自动生成机会并载入首个最优组合** → M1 价差折线自动出现 → 可点「开始监测」。
-
-## 使用流程（先后顺序）
-
-```
-启动 app.py → 账户管理页 → （先在 MT5 客户端登录）→ 绑定终端 → 打开控制台
-→ 连接（attach，等待 worker 上线）
-→ 规则·隔夜利息页：开启自动检测（swap 全表入库）
-→ 自动载入组合（或去【交易机会】页手动挑选）
-→ 【策略控制台】：统计先验（H1）→ M1 折线 → 阈值/极值线 → （开始就绪）
-→ 点「开始监测」→ kσ 网格分层信号（纸面模式默认只记录不下单）
-```
-
-数据的**顺序保证**（实现级）：
-
-1. 历史事件**按组合归属校验**（`(symbol, side, weight)` 签名）——旧组合晚到的历史直接丢弃；
-2. 历史请求节流**按组合分别 60s**——切新组合立即放行、同组合免重复；
-3. 机会计算在后台线程完成后**不再覆盖用户已手动选择的组合**；
-4. 历史数据的处理顺序固定：**统计先验（H1）→ 折线数据（M1）→ 阈值线 → 极值线 → 就绪**（避免空图先蹦阈值线）。
-
-## 价差公式与口径
-
-**乘法合成（外汇交叉盘口径）**：
-
-```
-合成买入 USDJPY (Ask) = USDCHF Ask × CHFJPY Ask
-价差 = 实际卖出 USDJPY (Bid) − 合成买入 USDJPY (Ask)
-```
-
-推广到任意腿数（对数线性实现，幂取 ±1 按腿方向）：
-
-```
-合成价 = exp( Σ s_i · log(侧价_i) )      [s_i=+1 买腿(取 ask)，s_i=−1 卖腿(取 bid)]
-价差  = 目标腿 Bid − 合成价               [目标腿 = 卖出方向 |权重| 最大腿]
-```
-
-要点：
-
-- **合成价与手数解耦**：定价幂是三角交叉面的定量（±1），手数比例走 `SpreadLeg.multiplier`（来自 USD 中性权重，最大腿归一）；
-- 历史序列 = 各腿 H1/M1 **bid 基 close** + 每腿当前点差近似 ask 侧；
-- 图表主视觉 = **M1 合成收盘折线**；统计先验（mean/std/n）用 H1 全窗（≥1 年）；1y/6m 极值线只作参考注记。
-
-## 策略引擎（Runner/Signal）
-
-- `SpreadSeries`：环形序列最大 200k 点；`stats()` 滚动窗 mean/std/z（numpy 向量化）；`extremes()` 1y/6m 长窗极值（60s TTL 缓存）；
-- 两段口径：live 点 <10 且有先验 → 用 H1 先验 mean/std；≥10 点 → 改用滚动窗口；
-- `SignalEngine`：上行 z 超过 `mean + (k + i·grid_step)·std` → 卖出方向第 i+1 层；下行对称（买入进场）；同一方向最多 `max_positions` 层，非同向独立计数；
-- 纸面模式（默认勾选）：只记录信号/分层，不下单；实盘模式每层触发即通过价差算法下单。
-
-## 价差算法执行（vnpy SpreadTakerAlgo 语义）
-
-```
-请求 {action: spread_algo, legs:[{symbol, side, volume}]}
-  → 订单线程（独立，串行发单）
-  → 主动腿吃单（IOC 市价，重报价类失败自动重试≤2 次）
-     ├─ 成交 → 事件 active → 立即对冲其余腿（hedge）
-     │         全部腿成交 → done → 5s 后裸腿复核（positions_get 对比 targets）
-     └─ 被拒（结构性错误）→ 即时 failed + UI critical 弹窗（防裸腿，绝不自动重复下单）
-stalled：任一阶段 30s 无回执 → 告警 + UI 提示人工介入
-audit_ok   / audit_mismatch：裸腿复核结果（差异 = 步长/2 容差）
-订单在专用线程执行：order_send 网络等待不再阻塞主请求循环（下单延迟从秒级降到毫秒级）
-```
-
-## 图表（v3 固定窗口折线）
-
-**设计立场：确定性 > 自由度**（历史多版问题的根源是 pyqtgraph 有状态自动机之间的互搏）。
-
-- 数据：单一 numpy 平行缓冲（`_buf_t/_buf_v`），只追加；
-- 视图：**显式量度**——每次重绘 `setXRange(窗口)` + `setYRange(窗口内数据±8%)`；
-- **不用 autoRange / setLimits / pan / zoom**（鼠标禁用），任何时刻重绘函数都是同一纯函数；
-- 窗口选择：图表左上角下拉框（近1小时/8小时/24小时/3天/7天/全部），默认近 8 小时；
-- 重绘：250ms 合并定时器 + 数据替换/窗口切换立即；250ms 频次下 14k 点切片 setData 几毫秒；
-- 十字光标：只读、40ms 节流、读数钉在视口右上角；
-- Y 轴：定点小数控轴 `_FixedFmtAxis`（小数位由刻度间隔自动推导，**全站禁科学计数法**）；
-- 阈值线可拖动（注：拖动调 k 与 spin 双向同步）。
-
-## 进程与线程模型
-
-| 线程/进程 | 职责 | 通信 |
-|---|---|---|
-| 主进程 EventEngine | 事件分发（有界队列 5000，满丢最旧+计数） | 内存事件总线 |
-| AccountSession req/rep 线程×N | JSON-lines 管道读写 | TCP + queue.Queue |
-| 心跳线程×N | 5s ping / 15s 死检 | EVENT_STATUS 告警 |
-| worker 主循环 | 请求分发（deserialize → dispatch） | req_q / rep_q |
-| worker 轮询 | ticks 0.2s + 快照 1s（持 `_mt5_lock`） | rep_q |
-| worker swap | 60s 全市场比对 | rep_q |
-| worker history | M1/H1 拉取（latest-wins） | rep_q |
-| worker order | 订单/算法串行发单 | rep_q |
-| UI 侧后台线程 | 终端扫描 / 机会计算 / session stop | Qt Signal（`_CallInMain`）跨线程回主线程 |
-
-退出链：console.close → bridge 反注册 → 后台 stop 线程（8s join+terminate）→ `app.py` atexit 兜底 join `stop-*` 线程 → EventEngine stop → DB close。
-
-## 事件总线
-
-| 事件 | 载荷要点 | 方向 |
-|---|---|---|
-| `eSessionStatus` | {ok,msg} | worker→UI |
-| `eAccount/ePosition/eOrder/eTick/eDeal/eSymbols` | 行情与账户快照 | worker→UI |
-| `eRules/eSwaps` | 合约规则/swap 全表+变化集+fx_rates | worker→UI |
-| `eSpreadHistory` | {datasets:{m1,h1:{t,v}}, legs} | worker→UI |
-| `eSpreadAlgo` | {algoid, stage, msg}（active/hedge/done/failed/stalled/audit_ok/audit_mismatch） | worker→UI |
-| `eOrderResult` | {ok,msg,request}（含重试计数文本） | worker→UI |
-| `eSymbolSubscribe/eOrderRequest/eDealRequest/eAlgoRequest/eLog` | 请求/日志 | UI→worker / 任意 |
-| （未入 constants）`ePong` | 心跳应答（worker 内本地常量并与 account_session 对齐） | worker→UI |
-
-## 数据与持久化
-
-SQLite（WAL 模式，`busy_timeout=3000`，单连接+全局锁，全部方法签名稳定）：
-
-- `terminals`：扫描/绑定终端路径
-- `accounts`：账户凭据（**仅本地 DB**，从不起终端）
-- `swap_snapshots`：隔夜利息快照（变化才写）
-- `trades` / `spread_points`：纸面/实盘记录与价差点位缓存
-
-## 测试
+## Windows打包（配置已写，未执行）
 
 ```powershell
-python -m pytest tests -q        # 61 用例（纯逻辑层：spreads/strategy/opportunities/db）
-python tests/run_smoke.py        # 无 pytest 环境的兜底 runner（退出码 0=全过）
+.\.venv\Scripts\python -m pip install -r requirements-build.txt
+.\.venv\Scripts\python -m PyInstaller --clean --noconfirm CFDInterestARB.spec
 ```
 
-关键公式都有断言（乘法合成、目标腿选择、kσ 网格触发、USD 中性闭环、DB 读写）；UI 层另有离线冒烟脚本（`QT_QPA_PLATFORM=offscreen`）覆盖"连接→自动载入→历史→live"全链路。
+采用onedir分发，保留console型子进程的stdin/stderr以供认证IPC。冻结exe以 `--worker <port>` 进入worker，不递归启动GUI。数据库必须位于用户可写目录，不能放入打包临时目录。
 
-## 监控与运维指标
+依赖仍未锁定：须先在Windows运行测试与打包验收，再保存实际 `pip freeze`、用 `pip-licenses --with-urls --with-license-file` 生成第三方许可清单，并审阅Qt及全部随包许可证。此处没有伪造经验证的版本锁或许可证结论。
 
-- UI 响应：机会计算后台化（UI 线程 0ms，原 442ms）；tick 路径纯 numpy 计算；
-- 行情到界面：<200ms（0.2s 轮询 + 事件分发 + Signal 桥）；
-- 重绘：250ms 合并节流，14k 点切片 setData ~2-3ms；
-- 内存：序列 200k 上限、信号 600 行上限、事件队列 5000 上限、rep 管道 2048 上限（均满即丢最旧+计数）；
-- 线程数恒定：5 worker 线程 + 会话 3 线程，无泄漏增长；
-- 长稳立项：心跳（断连即告警）、stderr drain（防子进程死锁）、断线自动重连（30s 周期）。
+## 性能与后台稳定性专项（源码已改，运行未验收）
 
-## 安全与实盘注意事项
+保留现有UI和第三方依赖，图表内部改用按屏幕时间分桶保留真实峰谷/首尾点的显示数据，33ms合并绘制请求；快照入队立即合并、账本索引只扫描活动批次、任务表复用单元格。worker新增执行进度健康检查、发送阻塞监视和有时限的回执排空。33ms不是端到端延迟承诺；全部行为仍待Windows验证。
 
-- **先纸面后实盘**：纸面模式勾选（默认）只记录不下单；切实盘前先小手数验证；
-- 账户密码仅存本地 SQLite；仓库**不含**任何凭据/账户数据；
-- `paused_migration/` 为已弃用的 DearPyGui 迁移归档（保留供未来参考），与运行无关；
-- 价差套利本身**存在残余敞口**（USD 中性 ≠ 全货币中性）；实盘前请对手数、点差与阈值做小规模验证；
-- 本项目为个人研究工具，不构成投资建议。
+完整候选库比较、替换门槛、剩余锁竞争/服务化边界与72小时验收方案见[性能专项报告](docs/PERFORMANCE-2026-10-15.md)。当前后台指关闭账户控制台后继续执行；退出整个主程序仍停止worker，尚不是独立Windows服务。任务进程异常后不会自动恢复交易开关或重发未知委托。
 
-## 提交历史（里程碑）
+### 第六轮修复：时间、统计与后台会话
 
-```
-03ed6f5  baseline: 阶段0诊断后的优化前快照
-76bdb62  第一批并行子任务（worker后台历史/熔断/会话健壮/策略向量化/console后台化/db WAL/tests 底座）
-c7e8c3e  第二批（订单独立线程+REQUOTE重试+心跳 / 表格 Model 化 / chart 缓冲复用+notify 限流 / 退出加固+EE 有界）
-c931aa6  图表纯折线方案（K 线退役）+ Y 轴定点小数（根除科学计数法）
-3192a8c  图表时序修复（历史归属校验/分组合节流/用户选择优先/视图跟随右缘）
-19599f1  图表 v3 系统性重写（固定窗口/显式坐标/零交互状态机）← 当前
-```
+最新审查的源码处理结果见 [REVIEW-FIXES-2026-10-15.md](docs/REVIEW-FIXES-2026-10-15.md)。保留原界面与 pyqtgraph；滚动统计窗口单位现为分钟，采用已收盘 M1 与 H1 先验平滑混合。后台事件快照以索引合并，心跳优先于用户请求；失败 worker 可在账户页清理后重连。
+
+账户“报价时间基准”默认 **UTC**。只有核实 broker 的 API tick 和历史 epoch 存在同一非标准偏移后，才配置如 `UTC+03:00` 或正确的 IANA 时区；终端图表显示的服务器时区不等于 API 必须换算。软件不根据旧报价自动猜时区。市场报价最大年龄默认 60 秒（可设 5–120 秒），与跨腿本轮读取最长 1 秒分别检查。IANA 夏令时需要声明的 `tzdata` 依赖，冻结打包已配置携带数据。
+
+按用户确认保留：账户任何挂单阻止新增仓位；断线导致任务暂停后，恢复连接也须人工分别启用入场/出场。清理 worker 后须先核对在途委托。所有本轮回归仅编写源码，未运行；Python 3.12 的手动 CI 配置也未触发，不能据此认定已经通过实盘或长期性能验收。

@@ -9,10 +9,11 @@
 from __future__ import annotations
 
 import queue
-import sys
 import threading
 import traceback
 from typing import Any, Callable, NamedTuple
+
+from .event_queue import EventQueue
 
 
 class Event(NamedTuple):
@@ -26,9 +27,9 @@ Handler = Callable[[Event], None]
 class EventEngine:
     def __init__(self) -> None:
         # 有界队列（maxsize=5000）：防止慢消费者场景下内存无界增长。
-        self._queue: "queue.Queue[Event]" = queue.Queue(maxsize=5000)
-        # 满载丢最旧事件的累计计数；每丢满 50 个向 stderr 打一行告警。
-        self.dropped = 0
+        self._queue: EventQueue = EventQueue(maxsize=5000)
+        # Snapshots coalesce immediately; critical events retain backpressure.
+        self._lock = threading.RLock()
         self._active = False
         self._thread: threading.Thread | None = None
         self._handlers: dict[str, set[Handler]] = {}
@@ -38,48 +39,45 @@ class EventEngine:
     # 注册
     # ------------------------------------------------------------------
     def register(self, event_type: str, handler: Handler) -> Handler:
-        self._handlers.setdefault(event_type, set()).add(handler)
+        with self._lock:
+            self._handlers.setdefault(event_type, set()).add(handler)
         return handler
 
     def unregister(self, event_type: str, handler: Handler) -> None:
-        handlers = self._handlers.get(event_type)
-        if handlers is None:
-            return
-        handlers.discard(handler)
-        if not handlers:
-            del self._handlers[event_type]
+        with self._lock:
+            handlers = self._handlers.get(event_type)
+            if handlers is not None:
+                handlers.discard(handler)
+                if not handlers:
+                    self._handlers.pop(event_type, None)
 
     def register_general(self, handler: Handler) -> Handler:
-        self._general_handlers.add(handler)
+        with self._lock:
+            self._general_handlers.add(handler)
         return handler
 
     def unregister_general(self, handler: Handler) -> None:
-        self._general_handlers.discard(handler)
+        with self._lock:
+            self._general_handlers.discard(handler)
 
     # ------------------------------------------------------------------
     # 发布与生命周期
     # ------------------------------------------------------------------
     def put(self, event: Event) -> None:
-        # 队列满时丢最旧保最新（后台分发线程 concurrent get 会并发取走事件，
-        # get_nowait 可能撞 Empty；简单 try/except 兜底即可，不做双重加锁）。
-        try:
-            self._queue.put_nowait(event)
-        except queue.Full:
-            try:
-                self._queue.get_nowait()   # 丢弃最旧事件
-            except queue.Empty:
-                pass
-            self.dropped += 1
-            if self.dropped % 50 == 0:
-                print(
-                    f"[EventEngine] queue full, dropped total={self.dropped}",
-                    file=sys.stderr,
-                )
+        # Reentrant handlers must not wait on their own dispatch thread.
+        # They publish synchronously only at saturation, preserving critical
+        # events without a queue deadlock. Normal producers apply backpressure.
+        if threading.current_thread() is self._thread:
             try:
                 self._queue.put_nowait(event)
             except queue.Full:
-                # 并发消费者瞬间取空又满的极端竞态：放弃本条（仍计入 dropped）。
-                self.dropped += 1
+                self._dispatch(event)
+        else:
+            self._queue.put(event)
+
+    @property
+    def dropped(self) -> int:
+        return self._queue.dropped
 
     def start(self) -> None:
         if self._active:
@@ -92,8 +90,8 @@ class EventEngine:
 
     def stop(self) -> None:
         self._active = False
-        if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=5)
+        if self._thread and self._thread.is_alive() and threading.current_thread() is not self._thread:
+            self._thread.join()
         self._thread = None
 
     @property
@@ -104,17 +102,23 @@ class EventEngine:
     # 内部
     # ------------------------------------------------------------------
     def _run(self) -> None:
-        while self._active:
+        while self._active or not self._queue.empty():
             try:
                 event = self._queue.get(timeout=1.0)
             except queue.Empty:
                 continue
-            self._dispatch(event)
+            try:
+                self._dispatch(event)
+            finally:
+                self._queue.task_done()
 
     def _dispatch(self, event: Event) -> None:
-        for handler in list(self._handlers.get(event.type, ())):
+        with self._lock:
+            handlers = tuple(self._handlers.get(event.type, ()))
+            general = tuple(self._general_handlers)
+        for handler in handlers:
             self._call(handler, event)
-        for handler in list(self._general_handlers):
+        for handler in general:
             self._call(handler, event)
 
     @staticmethod

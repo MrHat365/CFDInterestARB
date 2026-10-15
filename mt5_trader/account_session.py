@@ -1,358 +1,415 @@
-"""AccountSession —— 主进程侧的账户会话代理。
+"""One disposable worker generation per account; registry owns its lifetime.
 
-每个账户对应一个实例，内部以 **subprocess + JSON 管道** 拉起 worker 子进程
-（直接调 mt5；不用 multiprocessing.spawn —— DPG 的 DirectX 渲染上下文会让
-spawn 的管道句柄复制产生 WinError 5，multiprocessing.Queue 不可用）。
-职责：
-- 子进程 / 双队列生命周期管理（同旧接口，调用方无感）
-- GUI 请求（事件总线）→ req 管道转发（按 session=login@server 过滤）
-- rep 管道 → 事件总线回流（打上 session 标签）
-- 自身不 import MetaTrader5，主 GUI 进程零 mt5 调用
-
-会话键 = "login@server"，同一登录号连接不同服务器也是两个会话。
-扩展请求（rules/swap_watch/swap_unwatch/spread_history/spread_algo）在同一通道透传。
+No MT5 import in the GUI process. start() is nonblocking; stop() waits for the
+worker and must run outside Qt's main thread. Replies carry a generation token.
 """
-
 from __future__ import annotations
 
+import copy
 import json
-import queue as _queue
+import queue
+import secrets
 import socket
 import subprocess
 import sys
 import threading
 import time
+import uuid
 from pathlib import Path
-from typing import Any, Callable
+from typing import Callable
 
+from .connection_state import ConnectionState, Phase
 from .constants import (
-    EVENT_ALGO_REQUEST,
-    EVENT_DEAL_REQUEST,
-    EVENT_ORDER_REQUEST,
-    EVENT_STATUS,
-    EVENT_SYMBOL_SUBSCRIBE,
+    EVENT_AUTOMATION_STATE,
+    EVENT_MANAGED_STATE, EVENT_ACCOUNT, EVENT_ALGO_REQUEST, EVENT_DEAL_REQUEST, EVENT_LOG,
+    EVENT_ORDER_REQUEST, EVENT_RULES, EVENT_STATUS, EVENT_SWAPS,
+    EVENT_SYMBOL_SUBSCRIBE, EVENT_SYMBOLS, EVENT_TICK,
 )
-
-# stderr 保留尾部大小（供调试排查 worker 崩溃原因）
-_STDERR_TAIL_LIMIT = 64 * 1024
-
-# 心跳参数：每 5s ping 一次；15s 无任何 rep 回包记一次未命中，连续 3 次判死
-_HEARTBEAT_INTERVAL = 5.0
-_HEARTBEAT_TIMEOUT = 15.0
-_HEARTBEAT_MAX_MISSES = 3
 from .event_engine import Event, EventEngine
 
-# 直接透传给子进程 action 的事件（data 内带 session 与参数）
-PASSTHROUGH_ACTIONS = (
-    EVENT_SYMBOL_SUBSCRIBE,    # {symbol}
-    EVENT_ORDER_REQUEST,       # {kind, ...}
-    EVENT_DEAL_REQUEST,        # {days}
-)
+_REQUEST_EVENTS = (EVENT_SYMBOL_SUBSCRIBE, EVENT_ORDER_REQUEST,
+                   EVENT_DEAL_REQUEST, EVENT_ALGO_REQUEST)
+_CACHE_EVENTS = (EVENT_AUTOMATION_STATE, EVENT_MANAGED_STATE, EVENT_ACCOUNT, EVENT_RULES, EVENT_SWAPS, EVENT_SYMBOLS)
+_HEARTBEAT_INTERVAL = 5.0
+_HEARTBEAT_TIMEOUT = 20.0
+_START_TIMEOUT = 15.0
 
 
 class AccountSession:
-    """账户会话：GUI ↔ worker 子进程（subprocess + JSON 管道）。"""
-
-    def __init__(
-        self,
-        event_engine: EventEngine,
-        account: dict,
-        on_exit: Callable[[str], None] | None = None,
-    ) -> None:
+    def __init__(self, event_engine: EventEngine, account: dict,
+                 on_exit: Callable[[str], None] | None = None) -> None:
         self._ee = event_engine
         self.account = dict(account)
         self.name = f'{account["login"]}@{account["server"]}'
-        self._on_exit = on_exit or (lambda name: None)
-
-        # GUI→worker 请求队列（本地）；rep 由管道线程推进事件引擎
-        self._req_q: _queue.Queue = _queue.Queue()
-        self._stopped = False
+        self.generation = uuid.uuid4().hex
+        self._on_exit = on_exit
+        self._lock = threading.RLock()
+        self._state = ConnectionState()
+        self._cancel = threading.Event()
+        self._ping_pending = threading.Event()
+        self._reclaim_lock = threading.Lock()
+        self.closed = threading.Event()
+        self._req_q: queue.Queue = queue.Queue(maxsize=256)
         self._proc: subprocess.Popen | None = None
         self._conn: socket.socket | None = None
-        self._reader: threading.Thread | None = None
-        self._req_writer: threading.Thread | None = None
-        # 心跳线程与其 wakeup/退出事件；_last_rep_at 最近一次收到 rep 行的单调钟
-        self._heartbeat: threading.Thread | None = None
-        self._hb_stop = threading.Event()
-        self._last_rep_at: float = time.monotonic()
-        # stderr 尾部缓存（drain 线程写入，供崩溃后诊断）与丢弃行计数
-        self._stderr_tail: bytes = b""
-        self._stderr_lines = 0
+        self._thread: threading.Thread | None = None
+        self._threads: list[threading.Thread] = []
+        self._cache: dict[str, dict] = {}
+        self._last_pong = time.monotonic()
+        self._stderr_tail = b""
+        self._subscriptions: frozenset[str] = frozenset()
 
-        self._ee.register(EVENT_SYMBOL_SUBSCRIBE, self._on_event)
-        self._ee.register(EVENT_ORDER_REQUEST, self._on_event)
-        self._ee.register(EVENT_DEAL_REQUEST, self._on_event)
-        self._ee.register(EVENT_ALGO_REQUEST, self._on_event)
+    @property
+    def state(self) -> ConnectionState:
+        with self._lock:
+            return self._state
 
-    # ------------------------------------------------------------------
+    @property
+    def subscriptions(self) -> frozenset[str]:
+        with self._lock:
+            return self._subscriptions
+
+    def cached_events(self) -> list[Event]:
+        with self._lock:
+            return [Event(t, copy.deepcopy(data)) for t, data in self._cache.items()]
+
+    def status_event(self) -> Event:
+        with self._lock:
+            return self._event(EVENT_STATUS, self._state.payload())
+
+    def _event(self, etype: str, payload) -> Event:
+        return Event(etype, {"session": self.name, "generation": self.generation,
+                             "payload": payload})
+
+    def _transition(self, phase: Phase, message: str) -> None:
+        with self._lock:
+            self._state = self._state.transition(phase, message)
+            self._ee.put(self.status_event())
+
     def _worker_config(self) -> dict:
-        path = self.account.get("terminal_path") or None
-        return {
-            "login": self.account["login"],
-            "password": self.account.get("password", ""),
-            "server": self.account.get("server", ""),
-            "symbols": self.account.get("symbols", []),
-            "terminal_path": path,
-        }
+        # attach-only: passwords are neither needed nor sent across IPC.
+        return {"login": self.account["login"], "server": self.account.get("server", ""),
+                "symbols": self.account.get("symbols") or [],
+                "terminal_path": self.account.get("terminal_path"),
+                "execution_db": self.account.get("execution_db"),
+                'broker_timezone': self.account.get('broker_timezone', 'UTC'),
+                'quote_max_age': self.account.get('quote_max_age', 60)}
 
-    @staticmethod
-    def _free_port() -> int:
-        """本地空闲端口。"""
-        sock = socket.socket()
-        sock.bind(("127.0.0.1", 0))
-        port = sock.getsockname()[1]
-        sock.close()
-        return port
-
-    # ------------------------------------------------------------------
     def start(self) -> None:
-        """启动 worker 子进程（subprocess + 双向 JSON 管道，DPG 兼容）。"""
-        if self._stopped:
-            return
-        port = self._free_port()
-        self._proc = subprocess.Popen(
-            [sys.executable, "-m", "mt5_trader.worker_pipe", str(port)],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            close_fds=True,
-            cwd=str(Path(__file__).resolve().parent.parent),
-        )
+        with self._lock:
+            if self._thread is not None or self.closed.is_set():
+                return
+            self._transition(Phase.CONNECTING, "正在连接账户")
+            for etype in _REQUEST_EVENTS:
+                self._ee.register(etype, self._on_event)
+            self._thread = threading.Thread(target=self._run,
+                                            name=f"session-{self.name}", daemon=True)
+            self._thread.start()
 
-        # stderr drain：PIPE 不读会把子进程写满阻塞（P0-3）。
-        # 常驻 daemon 线程持续丢弃并计数，仅保留最后 64KB 尾部在内存；
-        # 子进程退出时 read() 返回空，线程自然结束，stop() 不 join。
-        def drain_stderr():
-            buf = bytearray()
-            proc_stderr = self._proc.stderr
-            try:
-                while True:
-                    chunk = proc_stderr.read(8192)
-                    if not chunk:
-                        break
-                    self._stderr_lines += 1
-                    buf.extend(chunk)
-                    if len(buf) > _STDERR_TAIL_LIMIT:
-                        del buf[:len(buf) - _STDERR_TAIL_LIMIT]
-                    self._stderr_tail = bytes(buf)
-            except Exception:
-                pass
+    def _spawn_thread(self, target, name: str) -> None:
+        thread = threading.Thread(target=target, name=f"{name}-{self.name}", daemon=True)
+        self._threads.append(thread)
+        thread.start()
 
-        threading.Thread(target=drain_stderr,
-                         name=f"stderr-{self.name}",
-                         daemon=True).start()
-
-        server = socket.socket()
-        server.bind(("127.0.0.1", port))
-        server.listen(1)
-        server.settimeout(15)
+    def _run(self) -> None:
         try:
-            conn, _ = server.accept()
-            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            self._conn = conn
-            # 首条：config（JSON 一行）
-            conn.sendall((json.dumps(self._worker_config(),
-                                      ensure_ascii=False) + "\n").encode("utf-8"))
-        except (socket.timeout, OSError) as exc:
-            self._push(f"worker 子进程连接失败: {exc!r}", "ERROR")
-            self._stopped = True
-            try:
-                self._proc.terminate()
-            except Exception:
-                pass
-            server.close()
-            return
-
-        # rep 线程（worker → 本地 rep 队列 → _forward_loop → 事件引擎）。
-        # 坏行只跳过不弃通道；EOF/OSError 在未主动 stop 时上报断线（R0-1）。
-        def read_rep_lines():
-            bad_lines = 0
-            warned_bad = False
-
-            def notify_closed(detail: str) -> None:
-                if self._stopped:
-                    return
-                self._push(f"worker 读取通道断开(EOF/{detail})", "ERROR")
-                self._ee.put(Event(
-                    EVENT_STATUS,
-                    {"session": self.name,
-                     "payload": {"ok": False,
-                                 "msg": "worker 通道断开（子进程可能已退出）"}},
-                ))
-
-            try:
-                # errors="replace"：编码坏行降级为占位符，交由下方解析跳过，
-                # 避免解码异常在迭代中直接炸掉整条读线程
-                for line in conn.makefile("r", encoding="utf-8",
-                                          errors="replace"):
-                    # 任一行（合法/坏行/空行）都证明 worker 侧还活着 → 喂心跳
-                    self._last_rep_at = time.monotonic()
-                    if not line.strip():
-                        continue
+            # Bind before spawning: no free-port race or early connection refusal.
+            with socket.socket() as server:
+                server.bind(("127.0.0.1", 0))
+                server.listen(4)
+                server.settimeout(0.2)
+                token = secrets.token_hex(32)
+                command = ([sys.executable, "--worker"] if getattr(sys, "frozen", False)
+                           else [sys.executable, "-m", "mt5_trader.worker_pipe"])
+                self._proc = subprocess.Popen(
+                    [*command, str(server.getsockname()[1])],
+                    stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE, close_fds=True,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                    cwd=str(Path(__file__).resolve().parent.parent),
+                )
+                # Secret travels over an inherited pipe, not the command line.
+                assert self._proc.stdin is not None
+                self._proc.stdin.write((token + "\n").encode())
+                self._proc.stdin.close()
+                self._spawn_thread(self._drain_stderr, "stderr")
+                deadline = time.monotonic() + _START_TIMEOUT
+                while not self._cancel.is_set():
+                    if self._proc.poll() is not None:
+                        raise ConnectionError("worker 启动失败；请检查 Windows/MetaTrader5 依赖")
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("worker 连接超时")
                     try:
-                        msg = json.loads(line)
-                    except ValueError:
-                        bad_lines += 1
-                        if bad_lines > 50 and not warned_bad:
-                            warned_bad = True
-                            self._push(
-                                f"worker 输出通道已跳过 {bad_lines} 条"
-                                "无法解析的行", "WARNING")
+                        conn, _ = server.accept()
+                    except socket.timeout:
                         continue
-                    self._rep(msg.get("type", "eUnknown"),
-                              msg.get("payload"))
-            except OSError as exc:
-                notify_closed(repr(exc))
-            else:
-                notify_closed("")
-
-        self._reader = threading.Thread(
-            target=read_rep_lines, name=f"pipe-{self.name}", daemon=True)
-        self._reader.start()
-
-        # req 线程（本地队列 → 管道）
-        def write_req_lines():
-            while not self._stopped:
-                try:
-                    raw = self._req_q.get()
-                except Exception:
+                    conn.settimeout(1.0)
+                    try:
+                        auth = b""
+                        while len(auth) < 65 and not auth.endswith(b"\n"):
+                            chunk = conn.recv(1)
+                            if not chunk:
+                                break
+                            auth += chunk
+                        if not secrets.compare_digest(auth, (token + "\n").encode()):
+                            conn.close()
+                            continue
+                    except OSError:
+                        conn.close()
+                        continue
+                    self._conn = conn
+                    conn.settimeout(None)
+                    conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                    conn.sendall((json.dumps(self._worker_config()) + "\n").encode())
                     break
-                try:
-                    self._conn.sendall((json.dumps(raw, ensure_ascii=False) + "\n")
-                                       .encode("utf-8"))
-                except Exception:
-                    break
-        self._req_writer = threading.Thread(
-            target=write_req_lines, name=f"req-{self.name}", daemon=True)
-        self._req_writer.start()
-
-        # 心跳线程：定期 ping worker，连续 15s 无 rep 回包 ×3 判死（不 join 子进程）
-        self._last_rep_at = time.monotonic()
-        self._hb_stop.clear()
-
-        def heartbeat_loop():
-            misses = 0
-            while True:
-                if self._hb_stop.wait(_HEARTBEAT_INTERVAL):
-                    return
-                if self._stopped:
-                    return
-                self._send_raw({"action": "ping"})
-                if time.monotonic() - self._last_rep_at >= _HEARTBEAT_TIMEOUT:
-                    misses += 1
-                    if misses >= _HEARTBEAT_MAX_MISSES:
-                        if not self._stopped:
-                            self._stopped = True
-                            self._push("心跳超时（15s+ 无 worker 回包）", "ERROR")
-                            self._ee.put(Event(
-                                EVENT_STATUS,
-                                {"session": self.name,
-                                 "payload": {"ok": False,
-                                             "msg": ("worker 心跳超时，"
-                                                     "会话可能已死亡")}},
-                            ))
-                            # 关读端让 pipe 线程自然退出（仿 stop，不 join 子进程）
-                            try:
-                                if self._conn is not None:
-                                    self._conn.shutdown(socket.SHUT_RDWR)
-                            except Exception:
-                                pass
-                        return
-                else:
-                    misses = 0
-
-        self._heartbeat = threading.Thread(
-            target=heartbeat_loop, name=f"hb-{self.name}", daemon=True)
-        self._heartbeat.start()
-
-        self._push("会话已启动（subprocess+管道）", "INFO")
-
-    def _rep(self, etype: str, payload: Any) -> None:
-        """rep 事件入事件引擎（打上 session 标签）。"""
-        if self._stopped:
-            return
-        self._ee.put(Event(etype, {"session": self.name, "payload": payload}))
-
-    # ------------------------------------------------------------------
-    def stop(self, close_terminal: bool = False) -> None:
-        """停止会话（纯 detach，终端进程保持运行；未完成对冲的算法会跑完）。"""
-        if self._stopped:
-            return
-        self._stopped = True
-        # 收心跳线程（Event 置位 + 短 join，避免线程再 ping/误告警）
-        self._hb_stop.set()
-        hb = self._heartbeat
-        if hb is not None and hb.is_alive():
-            hb.join(timeout=0.2)
-        self._send_raw({"action": "stop", "close_terminal": close_terminal})
-        try:
-            conn = self._conn
-            if conn is not None:
-                conn.shutdown(socket.SHUT_RDWR)   # 半关（req 写完 stop 后关读端）
-        except Exception:
-            pass
-        proc = self._proc
-        if proc is not None:
+            if self._cancel.is_set():
+                return
+            self._last_pong = time.monotonic()
+            self._spawn_thread(self._reader, "reply")
+            self._spawn_thread(self._writer, "request")
+            while not self._cancel.wait(_HEARTBEAT_INTERVAL):
+                if time.monotonic() - self._last_pong >= _HEARTBEAT_TIMEOUT:
+                    raise TimeoutError("worker 心跳超时，连接已失效")
+                self._ping_pending.set()
+        except Exception as exc:
+            if not self._cancel.is_set():
+                self._fail(str(exc))
+        finally:
+            self._cancel.set()
+            for etype in _REQUEST_EVENTS:
+                self._ee.unregister(etype, self._on_event)
+            # Writer owns stop ordering: discard unsent user requests, send stop,
+            # then let in-flight broker execution finish before closing transport.
+            proc = self._proc
             try:
-                proc.join(timeout=8)
-            except Exception:
-                pass
-            if proc.poll() is None:
-                proc.terminate()
-        self._push("会话已停止", "INFO")
+                if proc is not None:
+                    if not any(t.name.startswith("request-") for t in self._threads) and proc.poll() is None:
+                        proc.terminate()
+                    try:
+                        proc.wait(timeout=35)
+                    except subprocess.TimeoutExpired:
+                        self._push("worker 未在35秒内退出，强制结束；在途委托结果须在终端核对", "ERROR")
+                        proc.terminate()
+                        try:
+                            proc.wait(timeout=3)
+                        except subprocess.TimeoutExpired:
+                            proc.kill()
+                            proc.wait(timeout=3)
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                self._push(f"worker 清理失败，禁止重建会话直到确认进程已退出: {exc}", "ERROR")
+            if self._conn is not None:
+                try:
+                    self._conn.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                try:
+                    self._conn.close()
+                except OSError:
+                    pass
+            for thread in self._threads:
+                thread.join(timeout=2)
+            with self._lock:
+                if proc is None or proc.poll() is not None:
+                    if self._state.phase == Phase.STOPPING:
+                        self._transition(Phase.DISCONNECTED, "已断开")
+                    self.closed.set()
+                elif self._state.phase != Phase.FAILED:
+                    self._transition(Phase.FAILED, "进程尚未退出，请检查终端与系统进程")
+            if self._on_exit:
+                self._on_exit(self.name)
 
-    # ------------------------------------------------------------------
-    # 事件处理（GUI 请求，全部过滤自身会话）
-    # ------------------------------------------------------------------
+    def _drain_stderr(self) -> None:
+        proc = self._proc
+        if proc is None or proc.stderr is None:
+            return
+        with proc.stderr as stream:
+            while chunk := stream.read(4096):
+                self._stderr_tail = (self._stderr_tail + chunk)[-65536:]
+
+    def _reader(self) -> None:
+        conn = self._conn
+        if conn is None:
+            return
+        try:
+            with conn.makefile("r", encoding="utf-8") as stream:
+                for line in stream:
+                    msg = json.loads(line)
+                    if not isinstance(msg, dict) or not isinstance(msg.get("type"), str):
+                        raise ValueError("worker 协议载荷无效")
+                    if msg["type"] == "ePong":
+                        self._last_pong = time.monotonic()
+                        health = msg.get("payload") or {}
+                        if health.get("healthy") is False:
+                            stalled = ', '.join(health.get("stalled", []))
+                            self._fail(f"worker 执行停滞（{stalled}），已停止会话；请核对持仓后重新连接")
+                    else:
+                        self._rep(msg["type"], msg.get("payload"))
+        except (OSError, ValueError) as exc:
+            if not self._cancel.is_set():
+                self._fail(f"worker 通道异常: {exc}")
+        finally:
+            if not self._cancel.is_set():
+                self._fail("worker 通道已关闭")
+
+    def _writer(self) -> None:
+        conn = self._conn
+        if conn is None:
+            return
+        try:
+            while not self._cancel.is_set():
+                if self._ping_pending.is_set():
+                    self._ping_pending.clear()
+                    conn.sendall(b'{"action":"ping"}\n')
+                try:
+                    msg = self._req_q.get(timeout=0.2)
+                except queue.Empty:
+                    continue
+                if self._cancel.is_set():
+                    break
+                conn.sendall((json.dumps(msg, allow_nan=False) + "\n").encode())
+            conn.sendall(b'{"action":"stop"}\n')
+        except (OSError, ValueError) as exc:
+            if not self._cancel.is_set():
+                self._fail(f"worker 请求失败: {exc}")
+
+    def _fail(self, message: str) -> None:
+        with self._lock:
+            if self._state.phase in (Phase.FAILED, Phase.DISCONNECTED, Phase.STOPPING):
+                return
+            self._transition(Phase.FAILED, message)
+            self._cancel.set()
+
+    def _rep(self, etype: str, payload) -> None:
+        with self._lock:
+            if etype == EVENT_STATUS:
+                if self._cancel.is_set() or self._state.phase == Phase.STOPPING:
+                    return
+                phase = Phase.CONNECTED if payload.get("ok") else Phase.RECONNECTING
+                self._transition(phase, str(payload.get("msg", "")))
+                if phase != Phase.CONNECTED:
+                    self._subscriptions = frozenset()
+                    self._cache.clear()
+                return
+            # Keep final execution reports during graceful stop, but never fresh
+            # market data from a stopping/failed generation.
+            if self._cancel.is_set() and etype in (*_CACHE_EVENTS, EVENT_TICK):
+                return
+            if etype == EVENT_SYMBOLS:
+                self._subscriptions = frozenset(payload)
+            event = self._event(etype, payload)
+            if etype in _CACHE_EVENTS:
+                self._cache[etype] = copy.deepcopy(event.data)
+            self._ee.put(event)
+
+    @property
+    def worker_pid(self) -> int | None:
+        return self._proc.pid if self._proc is not None else None
+
+    def begin_stop(self) -> None:
+        """Atomically stop accepting replies/commands before publishing STOPPING."""
+        with self._lock:
+            if self.closed.is_set():
+                return
+            self._cancel.set()
+            if self._thread is None:
+                self.closed.set()
+                return
+            if self._state.phase != Phase.STOPPING:
+                self._transition(Phase.STOPPING, "正在断开，等待在途任务结束")
+
+    def stop(self, close_terminal: bool = False) -> None:
+        self.begin_stop()
+        if self._thread is None:
+            return
+        if threading.current_thread() is not self._thread:
+            self._thread.join(timeout=42)
+
+    def reclaim(self) -> bool:
+        """Retry cleanup of this owned worker only; never kill the MT5 terminal."""
+        if not self._reclaim_lock.acquire(blocking=False):
+            return False
+        try:
+            if self._thread is not None and self._thread.is_alive():
+                self._push('会话仍在清理，请等待后重试', 'ERROR')
+                return False
+            self.begin_stop()
+            proc = self._proc
+            try:
+                if proc is not None and proc.poll() is None:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait(timeout=3)
+                if proc is not None and proc.poll() is None:
+                    raise TimeoutError('worker仍未退出')
+            except (OSError, subprocess.TimeoutExpired, TimeoutError) as exc:
+                self._transition(Phase.FAILED, f'worker回收失败，禁止重连：{exc}')
+                return False
+            with self._lock:
+                self.closed.set()
+                if self._state.phase == Phase.STOPPING:
+                    self._transition(Phase.DISCONNECTED, 'worker已回收，请核对在途委托后重连')
+            return True
+        finally:
+            self._reclaim_lock.release()
+
     def _on_event(self, event: Event) -> None:
         data = event.data
-        if not (isinstance(data, dict) and data.get("session") == self.name):
+        if not isinstance(data, dict) or data.get("session") != self.name:
             return
-        if event.type == EVENT_SYMBOL_SUBSCRIBE:
-            self._send_raw({"action": "subscribe",
-                            "symbol": data.get("symbol", "")})
-        elif event.type == EVENT_ORDER_REQUEST:
-            request = {k: v for k, v in data.items() if k != "session"}
-            self._send_raw({"action": "order", "request": request})
-        elif event.type == EVENT_DEAL_REQUEST:
-            self._send_raw({"action": "deals", "days": int(data.get("days", 7))})
-        elif event.type == EVENT_ALGO_REQUEST:
-            # 价差算法执行：legs=[{symbol, side, volume(正手数)}]
-            self._send_raw({
-                "action": "spread_algo",
-                "legs": list(data.get("legs", [])),
-                "comment": str(data.get("comment", "")),
-            })
-
-    # 扩展 action 直发接口（控制台以方法方式调用）
-    def request_rules(self) -> None:
-        self._send_raw({"action": "rules"})
-
-    def watch_swaps(self, interval: int = 60) -> None:
-        self._send_raw({"action": "swap_watch", "interval": interval})
-
-    def unwatch_swaps(self) -> None:
-        self._send_raw({"action": "swap_unwatch"})
-
-    def request_spread_history(self, legs: list[dict]) -> None:
-        self._send_raw({"action": "spread_history", "legs": legs})
-
-    def request_deals(self, days: int = 7) -> None:
-        self._send_raw({"action": "deals", "days": int(days)})
-
-    # ------------------------------------------------------------------
-    def _send_raw(self, msg: dict) -> None:
-        # 仅入队：json 编码 + sendall 由 write_req_lines 写线程完成，
-        # 避免调用方线程（常为 UI）在管道写满时被 sendall 同步阻塞（P0-4）
-        if self._conn is None or self._stopped:
-            self._push(f"消息发送失败（会话未准）: {msg.get('action', '')}", "ERROR")
+        if data.get("generation") != self.generation:
             return
-        self._req_q.put(msg)
+        actions = {EVENT_SYMBOL_SUBSCRIBE: "subscribe", EVENT_DEAL_REQUEST: "deals",
+                   EVENT_ALGO_REQUEST: "spread_algo"}
+        raw = {k: v for k, v in data.items() if k not in ("session", "generation")}
+        if event.type == EVENT_ORDER_REQUEST:
+            self._send_raw({"action": "order", "request": raw})
+        else:
+            self._send_raw({**raw, "action": actions[event.type]})
 
-    def _push(self, msg: str, level: str = "INFO") -> None:
-        from .constants import EVENT_LOG
-        self._ee.put(Event(
-            EVENT_LOG,
-            {"session": self.name,
-             "payload": {"source": self.name, "msg": msg, "level": level}},
-        ))
+    def _send_raw(self, msg: dict) -> bool:
+        if self._cancel.is_set() or self._conn is None:
+            self._push(f"请求未接受（会话未就绪）: {msg.get('action')}", "ERROR")
+            return False
+        if msg.get("action") in ("order", "spread_algo", "managed_trade", "automation") and self._state.phase != Phase.CONNECTED:
+            self._push("请求未接受（账户未连接）", "ERROR")
+            return False
+        try:
+            self._req_q.put_nowait(msg)
+        except queue.Full:
+            self._push("请求未接受（队列已满），请稍后重试", "ERROR")
+            return False
+        return True
+
+
+    def request_managed_trade(self, message: dict) -> bool:
+        return self._send_raw({**message, "action": "managed_trade"})
+
+    def request_managed_state(self) -> bool:
+        return self._send_raw({"action": "managed_snapshot"})
+
+    def request_automation(self, message: dict) -> bool:
+        return self._send_raw({**message, "action": "automation"})
+
+    def request_rules(self) -> bool:
+        return self._send_raw({"action": "rules"})
+
+    def watch_swaps(self, interval: int = 60) -> bool:
+        return self._send_raw({"action": "swap_watch", "interval": interval})
+
+    def unwatch_swaps(self) -> bool:
+        return self._send_raw({"action": "swap_unwatch"})
+
+    def set_subscriptions(self, symbols: list[str]) -> bool:
+        return self._send_raw({"action": "subscriptions", "symbols": symbols})
+
+    def request_spread_history(self, legs: list[dict], request_id: str = "") -> bool:
+        return self._send_raw({"action": "spread_history", "legs": legs, "request_id": request_id})
+
+    def request_deals(self, days: int = 7) -> bool:
+        return self._send_raw({"action": "deals", "days": int(days)})
+
+    def _push(self, message: str, level: str = "INFO") -> None:
+        self._ee.put(self._event(EVENT_LOG, {"source": self.name, "msg": message, "level": level}))

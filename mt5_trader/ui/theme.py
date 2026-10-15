@@ -21,7 +21,7 @@ COLORS: dict[str, str] = {
     "ZEBRA": "#171c25",        # 斑马纹交替行
 }
 
-# 全局暗色 QSS 模板，覆盖 KPI 卡、表格、表单控件、按钮、导航、标签页、滚动条等。
+# 全局暗色 QSS 模板，覆盖表格、表单控件、按钮、导航、标签页、滚动条等。
 _DARK_QSS_TEMPLATE: str = """
 * {
     color: %(TXT_PRIMARY)s;
@@ -33,22 +33,6 @@ QWidget {
 }
 QLabel {
     background: transparent;
-}
-QLabel#KpiCard {
-    background-color: %(BG_PANEL)s;
-    border: 1px solid %(BORDER)s;
-    border-radius: 8px;
-}
-QLabel#KpiValue {
-    background: transparent;
-    font-family: Consolas, monospace;
-    font-size: 20px;
-    font-weight: bold;
-}
-QLabel#KpiTitle {
-    background: transparent;
-    color: %(TXT_MUTED)s;
-    font-size: 11px;
 }
 QTableWidget {
     background-color: %(BG_TABLE)s;

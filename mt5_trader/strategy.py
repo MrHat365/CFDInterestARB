@@ -13,20 +13,22 @@
   卖出组合方向记一笔进场（价差仅回落）; 下行对称。
   进场计数按「方向」累计，同一方向最多 max_positions 笔；非同一方向独立计数。
 
-统计口径分两段（先验 / 实时窗口）：
-  - 先验（prior）：由 StrategyRunner.set_history 载入的 H1 历史价差算出的
-    mean/std/n，用于实时点不足（<10 点）时的替代统计，替代时 stats 带 "prior": True；
-  - 实时窗口：on_tick 逐点追加的 live 点，满 10 点后改用滚动窗口统计；
-  - 长周期极值按时间戳切分段（365d/182d 截断），与统计口径相互独立。
+统计使用最近 window 个自然分钟内已收盘的 M1 值，空缺分钟不补造价格。
+H1 先验在 M1 样本不足时平滑混合，标准差下限为先验的 10%；
+轮询帧仅更新当前分钟收盘候选，不改变窗口长度。长期极值独立计算。
 """
 
 from __future__ import annotations
 
 import collections
 import math
+import itertools
 import datetime as dt
 
 import numpy as np
+
+from .series_data import normalize_series
+from .minute_statistics import MinuteStatistics
 
 _DAY = 86_400.0
 
@@ -44,27 +46,28 @@ class SpreadSeries:
 
     def append(self, ts: float, value: float) -> None:
         """追加一个 live 成点（历史点经 init_prior 载入，不走此接口）。"""
+        if not math.isfinite(ts) or not math.isfinite(value):
+            return
+        if self._t and ts < self._t[-1]:
+            return
+        if self._t and ts == self._t[-1]:
+            self._v[-1] = value
+            return
         self._t.append(ts)
         self._v.append(value)
         self._live_n += 1
 
     def init_prior(self, h1: dict) -> dict:
-        """用 H1 历史价差计算先验统计（mean/std/n）并写入序列缓存。
-
-        先验口径：全量 H1 历史（t=时间戳, v=价差值）无截断；
-        历史点同时进入 _t/_v 仅用于图表展示，不计数为 live 点。
-        :param h1: {"t": [...], "v": [...]}（t 与 v 长度相等，错位点静默跳过）
-        :returns: {"mean", "std", "n"}；不足 2 点时返回 {} 且不设置先验。
-        """
-        vs: list[float] = []
-        for t, v in zip(h1.get("t", []), h1.get("v", [])):
-            try:
-                ts_f, v_f = float(t), float(v)
-            except (TypeError, ValueError):
-                continue  # 错位点整体丢弃，保持 t/v 对齐
-            self._t.append(ts_f)
-            self._v.append(v_f)
-            vs.append(v_f)
+        """H1 提供先验/极值，M1 提供滚动统计；保留请求期间到达的实时尾部。"""
+        times, values = normalize_series(h1.get("t", []), h1.get("v", []))
+        self._t.clear()
+        self._v.clear()
+        self._prior = None
+        self._live_n = 0
+        self._ext_cache = None
+        self._t.extend(times)
+        self._v.extend(values)
+        vs = list(values)
         vt = np.asarray(vs, dtype=float)
         if vt.size < 2:
             return {}
@@ -87,15 +90,16 @@ class SpreadSeries:
         return len(self._v)
 
     def stats(self) -> dict:
-        """滚动窗口统计：缓存末尾 window 个点（含历史 + live 点，兼容旧 API）。
+        """滚动窗口统计：有live时仅取live尾部；无live时可查看历史统计。
 
         优先级由 StrategyRunner 决定：live <10 且有先验时缓存统计被先验替代；
         本方法仅在实时段成型（无先验或 live >=10）后直接作为口径使用。
         """
-        n = min(self.window, len(self._v))
+        available = min(self._live_n, len(self._v)) if self._live_n else len(self._v)
+        n = min(self.window, available)
         if n < 10:
             return {}
-        tail = np.asarray(list(self._v)[-n:], dtype=float)
+        tail = np.fromiter(itertools.islice(reversed(self._v), n), dtype=float, count=n)[::-1]
         mean = float(tail.mean())
         var = float(tail.var(ddof=1))
         std = max(var ** 0.5, 1e-12)
@@ -106,7 +110,7 @@ class SpreadSeries:
             "n_points": len(self._v),
         }
 
-    def extremes(self, now: float | None = None) -> dict:   # noqa: A003（与旧公开 API 同名）
+    def extremes(self, now: float | None = None) -> dict:   # 与旧公开 API 同名
         """长周期极值：按时间戳切分段（不再用序列前半段近似 6m）。
 
         以 now（缺省当前时间）往前 365d / 182d 截断，取落在窗口内的点求 max/min；
@@ -173,6 +177,8 @@ class SignalEngine:
         if not stats:
             return None
         mean, std, z = stats["mean"], stats["std"], stats["z"]
+        if not all(math.isfinite(x) for x in (mean, std, z)) or std <= 0:
+            return None
 
         # 离场：价差回到均值 ±0.3σ 内，清空同方向持仓
         for side in ("buy", "sell"):
@@ -180,16 +186,20 @@ class SignalEngine:
                 return {"action": "close", "side": side, "count": len(self._entries[side]),
                         "level": stats["last"], "z": round(z, 2)}
 
-        # 进场：Z 依次超过 mean ± (k + i*grid_step)·std，多腿（方向）独立计数
+        # The next unoccupied grid level is the only eligible next entry.
+        # Holding the same z must not consume the entire position budget.
         for direction in ("sell", "buy"):
-            for i in range(self.levels):
-                level_z = self.k + i * self.grid_step
-                upper_i = mean + level_z * std
-                lower_i = mean - level_z * std
-                if direction == "sell" and z >= level_z:
-                    return self._try_open(direction, stats, ts, upper_i, f"z={z:.2f}>+{level_z}")
-                if direction == "buy" and z <= -level_z:
-                    return self._try_open(direction, stats, ts, lower_i, f"z={z:.2f}<-{level_z}")
+            count = len(self._entries[direction])
+            if count >= self.max_positions:
+                if (direction == "sell" and z >= self.k) or (direction == "buy" and z <= -self.k):
+                    return {"action": "blocked", "side": direction, "level": stats["last"], "z": round(z, 2)}
+                continue
+            if count >= self.levels:
+                continue
+            level_z = self.k + count * self.grid_step
+            if (direction == "sell" and z >= level_z) or (direction == "buy" and z <= -level_z):
+                level = mean + (1 if direction == "sell" else -1) * level_z * std
+                return self._try_open(direction, stats, ts, level, f"grid={count + 1}")
         return None
 
     def _try_open(self, direction: str, stats: dict, ts: float, level: float, remark: str):
@@ -199,6 +209,14 @@ class SignalEngine:
         self._entries[direction].append((ts, level, remark))
         return {"action": "open", "side": direction,
                 "level": level, "count": len(self._entries[direction]), "z": round(stats["z"], 2)}
+
+    def restore_counts(self, counts: dict[str, int]) -> None:
+        """Live mode counts are confirmed ledger layers, never emitted intents."""
+        for side in ("buy", "sell"):
+            count = int(counts.get(side, 0))
+            if count < 0:
+                raise ValueError("negative position count")
+            self._entries[side] = [(0, 0, "confirmed") for _ in range(count)]
 
     def reset_direction(self, direction: str) -> None:
         self._entries[direction].clear()
@@ -224,6 +242,9 @@ class StrategyRunner:
             "max_positions": int(params.get("max_positions", 10)),
         }
         self.series = SpreadSeries(window=self.params["window"])
+        self.minute_stats = MinuteStatistics(self.params['window'])
+        self._last_timestamp = float('-inf')
+        self._last_spread: float | None = None
         self.signal = SignalEngine(
             strategy_id, k=self.params["k"], grid_step=self.params["grid_step"],
             levels=self.params["levels"], max_positions=self.params["max_positions"],
@@ -233,14 +254,28 @@ class StrategyRunner:
         self.hedge_note = "等手数中性（可调）"
 
     # ------------------------------------------------------------------
-    def set_history(self, h1: dict) -> None:
+    def set_history(self, h1: dict, m1: dict | None = None) -> None:
         """用 H1 历史价差做先验（t=时间戳, v=价差值）；仅唯一口径，避免混周期。
 
         两段口径：先验段（全量 H1）供 live 点 <10 时替代统计；
         实时段（on_tick 逐点）满 10 点后改用滚动窗口统计。
         """
+        times, values = self.series.arrays()
+        count = self.series.live_points()
+        live = list(zip(times[-count:], values[-count:])) if count else []
         self.prior = self.series.init_prior(h1)
+        latest_history = self.series._t[-1] if self.series._t else float("-inf")
+        for timestamp, value in live:
+            if timestamp > latest_history:
+                self.series.append(timestamp, value)
         self.long_stats = self.series.extremes()
+        self.minute_stats.seed(m1 or {})
+
+    def current_stats(self) -> dict:
+        self.minute_stats.window = max(10, self.series.window)
+        prior = self.series.prior()
+        last = self._last_spread if self._last_spread is not None else prior.get('mean', 0.)
+        return self.minute_stats.stats(last, prior)
 
     # ------------------------------------------------------------------
     def compute_spread(self, tick_map: dict[str, dict]) -> tuple[float, dict] | None:
@@ -260,7 +295,10 @@ class StrategyRunner:
         tl = tick_map.get(target["symbol"])
         if tl is None:
             return None
-        t_bid = float(tl["bid"])
+        t_bid = float(tl["ask"] if target.get("side", "buy") == "buy" else tl["bid"])
+        if not math.isfinite(t_bid) or t_bid <= 0:
+            return None
+        target_sign = 1.0 if target.get("side", "buy") == "buy" else -1.0
         synth = 0.0
         hedge = [{
             "symbol": target["symbol"], "side": target.get("side", "sell"),
@@ -275,9 +313,9 @@ class StrategyRunner:
             weight = float(leg.get("weight", 1.0))
             sign = 1.0 if leg["side"] == "buy" else -1.0
             side = float(tick["ask"]) if sign > 0 else float(tick["bid"])
-            if not (side > 0):
+            if not math.isfinite(side) or side <= 0:
                 return None
-            synth += sign * math.log(side)   # 幂 ±1（用户公式，不含手数权重）
+            synth += (-sign / target_sign) * math.log(side)
             hedge.append({
                 "symbol": leg["symbol"], "side": leg["side"],
                 "weight": weight, "price": side,
@@ -289,32 +327,32 @@ class StrategyRunner:
         spread = t_bid - synthetic
         return spread, hedge
 
-    def on_tick(self, tick_map: dict[str, dict]) -> dict | None:
+    def on_tick(self, tick_map: dict[str, dict], *, emit_signal: bool = True) -> dict | None:
         """消费一帧行情：追加 live 点并产出 {ts, spread, stats, hedge, signal, extremes}。
 
-        统计两段口径：live 点 <10 且存在先验时，用先验 mean/std + live last
-        计算 z，stats 带 "prior": True；live 点 >=10 改用滚动窗口统计（prior 标记消失）。
+        仅已收盘 M1 参与统计；当前分钟反复更新不会增加有效样本数。
         """
-        now = dt.datetime.now().timestamp()
+        try:
+            stamps = [(float(tick_map[leg['symbol']].get('time_msc') or
+                       float(tick_map[leg['symbol']]['time']) * 1000) / 1000) for leg in self.legs]
+        except (KeyError, TypeError, ValueError):
+            return None
+        if not stamps or not all(math.isfinite(t) for t in stamps):
+            return None
+        now = max(stamps)
+        if now < self._last_timestamp:
+            return None
         result = self.compute_spread(tick_map)
         if result is None:
             return None
         spread, hedge = result
+        self._last_timestamp, self._last_spread = now, spread
         self.series.append(now, spread)
-        prior = self.series.prior()
-        if prior and self.series.live_points() < 10:
-            # 先验段：用 H1 先验 mean/std 替代未成型的实时窗口
-            stats = {
-                "mean": prior["mean"], "std": prior["std"],
-                "z": (spread - prior["mean"]) / max(prior["std"], 1e-12),
-                "last": spread, "n_points": self.series.point_count(),
-                "prior": True,
-            }
-        else:
-            stats = self.series.stats()
+        self.minute_stats.append(now, spread)
+        stats = self.current_stats()
         if not stats:
             return None
-        sig = self.signal.on_spread(stats, now)
+        sig = self.signal.on_spread(stats, now) if emit_signal else None
         return {
             "ts": now, "spread": spread, "stats": stats, "hedge": hedge,
             "signal": sig, "extremes": self.series.extremes(),

@@ -23,7 +23,7 @@ class AccountsStore:
             row["terminal_path"] = t.get("path") if t else None
             row["terminal_data"] = t.get("data_folder", "") if t else ""
             row["terminal_name"] = (
-                (t.get("path") or "(仅数据目录绑定)") if t else "(自动/默认终端)"
+                (t.get("path") or "(仅数据目录绑定)") if t else "(未绑定终端)"
             )
             out.append(row)
         return out
@@ -62,6 +62,8 @@ class AccountsStore:
             "server": item.get("server", ""),
             "symbols": item.get("symbols", []),
             "terminal_id": terminal_id,
+            "broker_timezone": item.get('broker_timezone', 'UTC'),
+            "quote_max_age": item.get('quote_max_age', 60),
         }
         return self._db.upsert_account(item)
 

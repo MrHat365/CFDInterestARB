@@ -51,6 +51,9 @@ EVENT_ALGO_REQUEST = "eAlgoRequest"
 
 # Session -> GUI（价差算法执行进度）
 EVENT_SPREAD_ALGO = "eSpreadAlgo"
+EVENT_MANAGED_STATE = "eManagedState"
+EVENT_AUTOMATION_STATE = "eAutomationState"
+MAGIC_DEFAULT = 260100
 
 # Session -> GUI
 EVENT_ORDER_RESULT = "eOrderResult"
@@ -106,8 +109,8 @@ DEAL_TYPE_NAME = {
 # ---------------------------------------------------------------------------
 SWAP_MODE_NAME = {
     0: "无",                    1: "按点",
-    2: "入金货币(账户)",           3: "品种利润货币",
-    4: "保证金货币",
+    2: "品种基础货币",             3: "保证金货币",
+    4: "入金货币(账户)",
     5: "当前价年利率",             6: "开仓价年利率",
     7: "当日重开(按7)",            8: "次日重开(按8)",
 }

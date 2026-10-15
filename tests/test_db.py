@@ -10,7 +10,7 @@ import sqlite3
 import tempfile
 from pathlib import Path
 
-from mt5_trader.database import Database
+from mt5_trader.database import Database, default_database_path
 
 
 # ---------------------------------------------------------------------------
@@ -35,11 +35,8 @@ def test_database_instantiation_at_tempfile_path(tmp_path):
 
 
 def test_database_default_path_falls_back_to_package_dir():
-    instance = Database()
-    try:
-        assert instance.path.name == "mt5_trader.db"
-    finally:
-        instance.close()
+    # Resolving the default must not create or modify the user's actual DB.
+    assert default_database_path().name == "mt5_trader.db"
 
 
 # ---------------------------------------------------------------------------

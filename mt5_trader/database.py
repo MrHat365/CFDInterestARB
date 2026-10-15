@@ -16,6 +16,8 @@ import json
 import sqlite3
 import datetime as dt
 import threading
+import os
+import sys
 from pathlib import Path
 
 SCHEMA = """
@@ -69,13 +71,21 @@ CREATE INDEX IF NOT EXISTS idx_spread_key
 """
 
 
+def default_database_path() -> Path:
+    if getattr(sys, "frozen", False):
+        base = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
+        return base / "CFDInterestARB" / "mt5_trader.db"
+    return Path(__file__).parent / "mt5_trader.db"
+
+
 def _now() -> str:
     return dt.datetime.now().isoformat(timespec="seconds")
 
 
 class Database:
     def __init__(self, path: str | Path | None = None) -> None:
-        self.path = Path(path) if path else Path(__file__).parent / "mt5_trader.db"
+        self.path = Path(path) if path else default_database_path()
+        self.path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(self.path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         # 一次性 PRAGMA：WAL 提升并发读写，busy_timeout 避免锁争用抛错，
@@ -86,6 +96,11 @@ class Database:
         self._lock = threading.Lock()
         with self._lock:
             self._conn.executescript(SCHEMA)
+            columns = {row[1] for row in self._conn.execute('PRAGMA table_info(accounts)')}
+            if 'broker_timezone' not in columns:
+                self._conn.execute("ALTER TABLE accounts ADD COLUMN broker_timezone TEXT NOT NULL DEFAULT 'UTC'")
+            if 'quote_max_age' not in columns:
+                self._conn.execute('ALTER TABLE accounts ADD COLUMN quote_max_age REAL NOT NULL DEFAULT 60')
             self._conn.commit()
 
     # ------------------------------------------------------------------
@@ -95,8 +110,8 @@ class Database:
         """扫描结果 upsert（去重 + 存在性校验）；返回完整列表。
 
         注入前先用 Path(path).exists() 过滤幽灵路径（文件夹/文件已删但仍被
-        游留 AppData origin / 旧注册表项 / 运行中进程指向的终端），并顺手
-        清理库中已失效的旧行 —— 保证 terminals 表永远只给真实存在的路径。"""
+        游留 AppData origin / 旧注册表项 / 运行中进程指向的终端）。
+        已有失效路径仍保留，避免删除用户绑定。"""
         with self._lock:
             for item in found:
                 if not Path(item["path"]).exists():
@@ -115,17 +130,8 @@ class Database:
                         "INSERT INTO terminals(path, name, data_folder, scanned_at) VALUES(?,?,?,?)",
                         (item["path"], item.get("name", ""), item.get("data_folder", ""), _now()),
                     )
-            # 清理幽灵行：路径已不存在的终端记录直接删除
-            stale = [
-                r["id"] for r in self._conn.execute(
-                    "SELECT id, path FROM terminals"
-                ).fetchall()
-                if not Path(r["path"]).exists()
-            ]
-            if stale:
-                self._conn.executemany(
-                    "DELETE FROM terminals WHERE id = ?", [(i,) for i in stale]
-                )
+            # Preserve missing paths: deleting a bound row loses the user's
+            # configuration and leaves accounts.terminal_id dangling.
             self._conn.commit()
             rows = self._conn.execute(
                 "SELECT id, path, name, data_folder, scanned_at FROM terminals ORDER BY id"
@@ -175,17 +181,18 @@ class Database:
             symbols = ",".join(item.get("symbols", []))
             if cur:
                 self._conn.execute(
-                    "UPDATE accounts SET password=?, terminal_id=?, symbols=? WHERE id=?",
+                    "UPDATE accounts SET password=?, terminal_id=?, symbols=?, broker_timezone=?, quote_max_age=? WHERE id=?",
                     (item["password"], item.get("terminal_id") or None,
-                     symbols, cur["id"]),
+                     symbols, item.get('broker_timezone', 'UTC'), item.get('quote_max_age', 60), cur["id"]),
                 )
                 account_id = cur["id"]
             else:
                 cur = self._conn.execute(
-                    "INSERT INTO accounts(login, server, password, terminal_id, symbols, created_at) "
-                    "VALUES(?,?,?,?,?,?)",
+                    "INSERT INTO accounts(login, server, password, terminal_id, symbols, created_at, broker_timezone, quote_max_age) "
+                    "VALUES(?,?,?,?,?,?,?,?)",
                     (item["login"], item["server"], item["password"],
-                     item.get("terminal_id") or None, symbols, _now()),
+                     item.get("terminal_id") or None, symbols, _now(),
+                     item.get('broker_timezone', 'UTC'), item.get('quote_max_age', 60)),
                 )
                 account_id = cur.lastrowid
             self._conn.commit()
@@ -210,8 +217,8 @@ class Database:
                 ).fetchone()
                 same = (
                     last is not None
-                    and last["swap_long"] == round(it["swap_long"], 10)
-                    and last["swap_short"] == round(it["swap_short"], 10)
+                    and round(last["swap_long"], 10) == round(it["swap_long"], 10)
+                    and round(last["swap_short"], 10) == round(it["swap_short"], 10)
                     and last["rollover3days"] == it["rollover3days"]
                 )
                 if last is None or not same:

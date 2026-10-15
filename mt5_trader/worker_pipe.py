@@ -1,12 +1,4 @@
-"""worker 子进程入口（DPG 迁移配套）：subprocess + JSON 管道。
-
-为什么不用 multiprocessing.spawn：DearPyGui 在 Windows 上创建 DirectX 渲染
-上下文后，spawn 的管道句柄复制会因句柄继承策略产生 WinError 5（拒绝访问），
-multiprocessing.Queue 完全不可用。改用独立窗口子进程 + 双向 JSON-lines 管道：
-  父进程（GUI）→ {port} 传参 → 子进程连回 → 父发 config 一行 →
-  子进程 worker_main(pair of queue.Queue)；每行一条 {"type","payload"} 消息。
-worker 内部代码与 Qt 版 100% 复用（worker_main 不感知 IPC 载体）。
-"""
+"""Authenticated loopback JSON-lines transport for one disposable MT5 worker."""
 
 from __future__ import annotations
 
@@ -15,79 +7,95 @@ import queue
 import socket
 import sys
 import threading
-from pathlib import Path
+import time
 
-REP_Q_MAXSIZE = 2048   # 回复队列上限：GUI 卡顿时丢弃最旧压入失败的事件而非阻塞 worker
+from mt5_trader.event_queue import EventQueue
+
+REP_Q_MAXSIZE = 2048
+_ReplyQueue = EventQueue
 
 
-class _ReplyQueue(queue.Queue):
-    """worker → GUI 的有界回复队列（替代无界 queue.Queue）。
-
-    worker._send 只调用 .put()；这里覆写为 put_nowait，队列满（GUI 消费慢/
-    管道阻塞）时丢弃该条事件并计数，每 64 次向 stderr 提示一次。
-    丢弃的是历史行情/快照类事件，ORDER_RESULT 等关键事件靠 GUI 正常消费保障。"""
-
-    def __init__(self, maxsize: int = REP_Q_MAXSIZE) -> None:
-        super().__init__(maxsize=maxsize)
-        self.dropped = 0
-
-    def put(self, item, block=True, timeout=None):   # noqa: ARG002 与 Queue.put 签名兼容
-        # 不能走 self.put_nowait / 基类 put：Queue.put(block=False) 内部回调
-        # self.put_nowait、Queue.put_nowait 又回调 self.put，覆写后会无限递归；
-        # 故直接复刻 put_nowait 内部逻辑（_put + not_empty 通知）。
-        with self.not_full:
-            if self.maxsize > 0 and self._qsize() >= self.maxsize:
-                self.dropped += 1
-                if self.dropped % 64 == 0:
-                    print(
-                        f"[pipe-rep] 回复队列已满（maxsize={self.maxsize}），"
-                        f"累计丢弃 {self.dropped} 条事件",
-                        file=sys.stderr,
-                    )
-                return None
-            self._put(item)
-            self.unfinished_tasks += 1
-            self.not_empty.notify()
-        return None
-
-from mt5_trader.event_engine import Event  # noqa: F401
-from mt5_trader.constants import EVENT_DEAL_REQUEST  # noqa: F401
-from mt5_trader.worker import worker_main
+def drain_replies(reply_queue, timeout=5.0):
+    """Bounded shutdown flush; never claim unsent replies were delivered."""
+    deadline = time.monotonic() + timeout
+    with reply_queue.all_tasks_done:
+        while reply_queue.unfinished_tasks:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            reply_queue.all_tasks_done.wait(remaining)
+    return True
 
 
 def _jsonable(value):
     """payload 递归 JSON 化（namedtuple/bytes/datetime 兑底）。"""
     if value is None or isinstance(value, (bool, int, float, str)):
         return value
+    has_asdict = getattr(value, "_asdict", None)
+    if has_asdict:
+        return _jsonable(dict(has_asdict()))
     if isinstance(value, (list, tuple)):
         return [_jsonable(v) for v in value]
     if isinstance(value, dict):
         return {str(k): _jsonable(v) for k, v in value.items()}
-    has_asdict = getattr(value, "_asdict", None)
-    if has_asdict:
-        return _jsonable(dict(has_asdict()))
     return str(value)
 
 
 def main(port: int) -> None:
-    sock = socket.create_connection(("127.0.0.1", port))
-    req_q: "queue.Queue" = queue.Queue()
+    sock = socket.create_connection(("127.0.0.1", port), timeout=10)
+    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    token = sys.stdin.readline().strip()
+    if len(token) != 64:
+        raise ValueError("Missing worker authentication")
+    sock.sendall((token + "\n").encode())
+    req_q: "queue.Queue" = queue.Queue(maxsize=256)
     rep_q: "_ReplyQueue" = _ReplyQueue(REP_Q_MAXSIZE)
 
     # 读 config 一行（首条）
     reader = sock.makefile("r", encoding="utf-8")
     config = json.loads(reader.readline())
-    req_q.put(config)   # worker 首条请求忽略（worker 不读握手）
+    sock.settimeout(None)  # Reader is idle legitimately; send watchdog is separate.
+    # MT5 import follows authenticated IPC setup.
+    from mt5_trader.worker import _Worker
+    worker = _Worker(req_q, rep_q, config)
 
     def forward_requests():
-        """GUI -> worker：req_from_parent 一行一个 action。
-        （config 由 worker_main 自行从 req_q 接收——首条消息。）"""
+        """GUI -> worker; stop/ping remain responsive during MT5 initialization."""
         try:
             for line in reader:
                 if line.strip():
-                    req_q.put(json.loads(line))
-        except Exception:
-            pass
+                    msg = json.loads(line)
+                    if msg.get("action") == "stop":
+                        worker.request_stop()
+                    elif msg.get("action") == "ping":
+                        # A live pipe does not prove that execution is advancing.
+                        health = worker._health.snapshot()
+                        if not health['healthy']:
+                            worker.request_stop()
+                        rep_q.put({"type": "ePong", "payload": health})
+                    else:
+                        req_q.put(msg, timeout=1)
+        except (OSError, ValueError, queue.Full) as exc:
+            print(f"[pipe-req] {exc!r}", file=sys.stderr)
+        finally:
+            worker.request_stop()
+
+    transport_failed = threading.Event()
+    transport_closed = threading.Event()
+    send_started: list[float | None] = [None]
+
+    def watch_sender():
+        while not transport_closed.wait(.5):
+            started = send_started[0]
+            if started is not None and time.monotonic() - started >= 10:
+                print('[pipe-rep] 发送超过10秒，断开通道；未确认回执须从账本核对', file=sys.stderr)
+                transport_failed.set()
+                worker.request_stop()
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                return
 
     def forward_replies():
         """worker -> GUI：rep 一行一条事件（含 ORDER_RESULT 等）。"""
@@ -95,8 +103,12 @@ def main(port: int) -> None:
         try:
             while True:
                 msg = rep_q.get()
-                payload = _jsonable(msg.get("payload"))
                 try:
+                    if transport_failed.is_set():
+                        # The parent is gone: drain to unblock worker shutdown.
+                        continue
+                    payload = _jsonable(msg.get("payload"))
+                    send_started[0] = time.monotonic()
                     sock.sendall(
                         (json.dumps({"type": msg.get("type", "eUnknown"),
                                      "payload": payload}, ensure_ascii=False)
@@ -105,17 +117,34 @@ def main(port: int) -> None:
                     if not send_fail_reported:
                         send_fail_reported = True
                         print(
-                            f"[pipe-rep] 回复发送失败，转发线程退出: {exc!r}",
+                            f"[pipe-rep] 回复发送失败，停止worker并排空本地队列: {exc!r}",
                             file=sys.stderr,
                         )
-                    return
-        except Exception:
-            pass
+                    transport_failed.set()
+                    worker.request_stop()
+                finally:
+                    send_started[0] = None
+                    rep_q.task_done()
+        except Exception as exc:
+            print(f"[pipe-rep] {exc!r}", file=sys.stderr)
+            transport_failed.set()
+            worker.request_stop()
 
     threading.Thread(target=forward_requests, name="pipe-req", daemon=True).start()
     threading.Thread(target=forward_replies, name="pipe-rep", daemon=True).start()
+    threading.Thread(target=watch_sender, name="pipe-send-watch", daemon=True).start()
 
-    worker_main(req_q, rep_q, config)  # 阻塞运行 worker
+    try:
+        worker.run()
+        if not drain_replies(rep_q):
+            print('[pipe-rep] 回执排空超时；执行结果须从持久账本核对', file=sys.stderr)
+    finally:
+        transport_closed.set()
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        sock.close()
 
 
 

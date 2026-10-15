@@ -14,34 +14,37 @@ from __future__ import annotations
 import datetime as dt
 import functools
 import threading
+import uuid
+import math
 import time
 from typing import NamedTuple
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from ..account_session import AccountSession
+from ..connection_state import Phase
+from ..series_data import normalize_series, quotes_ready
 from ..accounts import AccountsStore
 from ..constants import (
+    EVENT_AUTOMATION_STATE,
+    EVENT_MANAGED_STATE,
     EVENT_ACCOUNT,
-    EVENT_ALGO_REQUEST,
     EVENT_DEAL,
-    EVENT_DEAL_REQUEST,
     EVENT_LOG,
-    EVENT_ORDER_REQUEST,
     EVENT_POSITION,
     EVENT_RULES,
     EVENT_SPREAD_ALGO,
     EVENT_SPREAD_HISTORY,
     EVENT_STATUS,
     EVENT_SWAPS,
-    EVENT_SYMBOL_SUBSCRIBE,
     EVENT_TICK,
 )
 from ..database import Database
-from ..event_engine import Event
 from ..opportunities import generate
 from ..strategy import StrategyRunner
+from ..managed_trading import strategy_key
 from .base import EventBridge
+from .automation import AutomationPanel
 from .chart import SpreadChart
 from .kpi import StatusPill
 from .notify import ToastManager
@@ -152,16 +155,6 @@ SIGNAL_COLUMNS = [
 ]
 
 
-def _fmt_value(value) -> str:
-    """通用格式化：浮点禁止科学计数法。"""
-    if value is None:
-        return "-"
-    if isinstance(value, float):
-        text = f"{value:.12f}".rstrip("0").rstrip(".")
-        return text if text else "0"
-    return str(value)
-
-
 def _f(v, default: float = 0.0) -> float:
     """payload 数值安全取值：None/非法 -> default。"""
     try:
@@ -170,13 +163,6 @@ def _f(v, default: float = 0.0) -> float:
         return float(v)
     except (TypeError, ValueError):
         return default
-
-
-def _compact_ts(text: str | None) -> str | None:
-    """'2026-02-03 12:22:07' -> '02-03 12:22'（顶栏小字）。"""
-    if not text:
-        return None
-    return text[5:16] if len(text) >= 16 else text
 
 
 def _mk(mapping: dict[int, str], flags_value) -> str:
@@ -205,52 +191,11 @@ def _decorate_rule_row(row: dict) -> dict:
     return out
 
 
-class _MoneyDelegate(QtWidgets.QStyledItemDelegate):
-    """money 列三态着色：正 #16c784 / 负 #ea3943 / 零 #8b93a3。"""
-
-    def __init__(self, money_columns: set[int], parent=None) -> None:
-        super().__init__(parent)
-        self._money_columns = money_columns
-
-    def initStyleOption(self, option, index) -> None:  # noqa: N802
-        super().initStyleOption(option, index)
-        if index.column() not in self._money_columns:
-            return
-        text = index.data(QtCore.Qt.ItemDataRole.DisplayRole)
-        text = text if isinstance(text, str) else ""
-        if text.startswith("+"):
-            color = _C_MONEY_UP
-        elif text.startswith("-"):
-            color = _C_MONEY_DOWN
-        else:
-            color = _C_MONEY_ZERO
-        option.palette.setColor(
-            QtGui.QPalette.ColorRole.Text, QtGui.QColor(color)
-        )
-
-
 _NUM_ROLE = QtCore.Qt.ItemDataRole.UserRole + 1   # 数值排序键（EditRole 会被 Qt 转字符串）
 
 
 class _SpreadTableModel(QtCore.QAbstractTableModel):
-    """MiniTable 的数据模型（数据/视图分离）：list[dict] 行 + ColumnSpec 列。
-
-    原 QTableWidget 版散落在 _make_item / _SortItem / _MoneyDelegate 的
-    职责全部并入本 model：
-    - DisplayRole：同一取文规则（money ``f"{raw:+,.2f}"``、其它浮点走
-      _fmt_value 禁科学计数法、None/缺键 -> "-"）；
-    - TextAlignmentRole：按列 kind（数字/time 右+竖中、sym 左、enum 中）；
-    - FontRole：数字列 Consolas（与原 _make_item 的 setFont 一致）；
-    - ToolTipRole：整行 tooltip（row["_tooltip"]）；
-    - ForegroundRole：money 列三态（正 #16c784 / 负 #ea3943 / 零 #8b93a3）。
-      选型：配色并入模型而非保留 _MoneyDelegate —— 着色判定与显示文本同源
-      （见 _money_color），update_cell/set_rows 发 dataChanged 后颜色随行值
-      自动刷新，不需要按列挂 delegate；
-    - UserRole+1（复用 _NUM_ROLE）：数值列返回 float，作为 sort() 排序键。
-
-    定序口径与原 _SortItem.__lt__ 相同：数值列双方都有 float 键时按数值比，
-    否则退化到显示文本比较（见 _spread_row_cmp）。
-    """
+    """表格数据、格式化、对齐、金额着色与稳定排序的统一模型。"""
 
     def __init__(self, columns: list[ColumnSpec], parent=None) -> None:
         super().__init__(parent)
@@ -374,12 +319,6 @@ class _SpreadTableModel(QtCore.QAbstractTableModel):
                 return i
         return None
 
-    def display_text(self, r: int, c: int) -> str:
-        """供 _auto_fit_columns 计宽（等价旧 item(r, c).text()）。"""
-        return self._display_text(
-            self._rows[r], self.specs[c]
-        )
-
     # ------------------------------------------------------------------
     # 取文 / 对齐 / 着色 / 排序键（与原 _make_item / _SortItem 同一规则）
     # ------------------------------------------------------------------
@@ -413,7 +352,7 @@ class _SpreadTableModel(QtCore.QAbstractTableModel):
 
     @staticmethod
     def _money_brush(raw, spec: ColumnSpec) -> QtGui.QBrush | None:  # noqa: N805
-        """money 三态着色（与原 _MoneyDelegate 一致：按显示文本前缀判定）。"""
+        """money 三态着色，按显示文本前缀判定。"""
         if spec.kind != "money":
             return None
         text = _fmt_value(raw, spec)
@@ -583,26 +522,6 @@ class MiniTable(QtWidgets.QTableView):
         super().showEvent(e)
         QtCore.QTimer.singleShot(0, self._distribute)
 
-    def _auto_fit_columns(self) -> None:
-        """列宽自适应：列宽不应小于表头 / 单元格光学宽度（中文按主题字体、
-        数字按 Consolas 计宽）+ padding；开用户拖动时基准取 max(用户调整, 内容)"""
-        from PySide6 import QtGui as _qg
-        fm_text = _qg.QFontMetrics(self.font())
-        fm_mono = _qg.QFontMetrics(_qg.QFont("Consolas"))
-        hdr_fm = _qg.QFontMetrics(self.horizontalHeader().font())
-        header_pad = 26   # 表头 padding + 排序指示器
-        cell_pad = 18     # 单元格 padding
-        for c, spec in enumerate(self._cols):
-            w = hdr_fm.horizontalAdvance(spec.title) + header_pad
-            for r in range(self._model.rowCount()):
-                fm = fm_mono if spec.kind in ("int", "px", "money", "pct") else fm_text
-                w = max(
-                    w,
-                    fm.horizontalAdvance(self._model.display_text(r, c)) + cell_pad,
-                )
-            self._base[c] = max(self._base[c], min(w, 600))
-        self._distribute()
-
     def _on_section_resized(self, col: int, old: int, new: int) -> None:
         if self._filling:
             return
@@ -707,12 +626,17 @@ class AccountConsole(QtWidgets.QMainWindow):
     # 信号行上限（_signals_rows 无界增长会拖慢 set_rows 全量重建）
     _SIGNALS_CAP = 600
     def __init__(self, event_engine, account: dict, store: AccountsStore,
-                 db: Database, on_closed=None) -> None:
+                 db: Database, sessions, on_closed=None) -> None:
         super().__init__()
         self._ee = event_engine
         self._account = account
         self._store = store
         self._db = db
+        self._sessions = sessions
+        self._closed = False
+        self._history_request: str | None = None
+        self._history_requested_at = 0.0
+        self._last_frame: tuple | None = None
         self._on_closed = on_closed
         self._session: AccountSession | None = None
         self._last_ticks: dict = {}
@@ -721,13 +645,17 @@ class AccountConsole(QtWidgets.QMainWindow):
         self._current_legs: list | None = None
         self._monitoring = False
         self._signals_rows: list = []
-        self._runner = None
+        self._runner: StrategyRunner | None = None
         self._hist_ready = False
         self._account_currency = "USD"
         self._conn_state = "waiting"
+        self._opp_cancel = threading.Event()
+        self._managed_state = {}
+        self._managed_pending: str | None = None
+        self._managed_sent_at = 0.0
+        self._automation_active = 0
         self._opp_thread = False        # 机会计算线程在跑（防重入）
         self._auto_load_pending = False  # 自动载入首个组合挂起（后台计算完成后消费）
-        self._hist_req_by_sig: dict[tuple, float] = {}   # 组合签名 -> 上次历史请求时间（按组合分别 60s 节流）
 
         # 后台线程 -> 主线程回调桥（机会计算结果投递等）
         self._callin = _CallInMain(self)
@@ -756,16 +684,19 @@ class AccountConsole(QtWidgets.QMainWindow):
         self._tabs.addTab(self._build_tab_data(), "规则 · 隔夜利息")
         self._tabs.addTab(self._build_tab_opp(), "交易机会")
         self._tabs.addTab(self._build_tab_strategy(), "策略控制台")
+        self._automation_panel = AutomationPanel(self._send_automation, self._automation_seed, self)
+        self._tabs.addTab(self._automation_panel, "后台自动交易")
         layout.addWidget(self._tabs, stretch=1)
         self.setCentralWidget(central)
 
         # Toast 浮层通知（右下角，订阅 eOrderResult / eLog）
         self._toast_mgr = ToastManager()
         self._toast_mgr.attach(self)
-        self._toast_mgr.notify_hook(self._ee, session_name=self.session_name)
+        self._toast_mgr.notify_hook(self._ee, session_name=self.session_name,
+                                    accept_event=self._sessions.is_current)
 
         # 快捷键：Ctrl+1..3 切 Tab；Escape 停止监测
-        for i in range(3):
+        for i in range(4):
             QtGui.QShortcut(
                 QtGui.QKeySequence(f"Ctrl+{i + 1}"), self,
                 activated=lambda idx=i: self._tabs.setCurrentIndex(idx),
@@ -933,22 +864,33 @@ class AccountConsole(QtWidgets.QMainWindow):
         self._spin_volume.setRange(0.01, 100)
         self._spin_volume.setSingleStep(0.01)
         self._spin_volume.setValue(0.01)
-        self._chk_paper = QtWidgets.QCheckBox("纸面模式（只记录不下单）")
+        self._chk_paper = QtWidgets.QCheckBox("纸面模式（取消后允许受管实盘开平仓）")
         self._chk_paper.setChecked(True)
         self._chk_paper.toggled.connect(self._update_mode)
         for label, w in (
-            ("Z窗口", self._spin_window), ("入场阈值 k", self._spin_k),
+            ("Z窗口（分钟）", self._spin_window), ("入场阈值 k", self._spin_k),
             ("网格步进 σ", self._spin_grid), ("网格层数", self._spin_levels),
-            ("最大持仓(方向)", self._spin_maxpos),
-            ("每层手数(逐步小单)", self._spin_volume),
+            ("最大层数(每方向)", self._spin_maxpos),
+            ("最重腿手数/层", self._spin_volume),
         ):
             form.addRow(label, w)
+        self._spin_lot_cap = QtWidgets.QDoubleSpinBox()
+        self._spin_lot_cap.setRange(0, 10000)
+        self._spin_lot_cap.setDecimals(2)
+        self._spin_lot_cap.setSpecialValueText("实盘前必须设置")
+        self._spin_margin_cap = QtWidgets.QDoubleSpinBox()
+        self._spin_margin_cap.setRange(0, 100)
+        self._spin_margin_cap.setSuffix("%")
+        self._spin_margin_cap.setSpecialValueText("实盘前必须设置")
+        form.addRow("账户总手数上限", self._spin_lot_cap)
+        form.addRow("保证金使用率上限", self._spin_margin_cap)
         form.addRow("", self._chk_paper)
         rv.addLayout(form)
 
         # 2×2 网格而非单行 4 按钮：避免右栏最小宽度过大撑爆 7:3 比例
         btns = QtWidgets.QGridLayout()
-        btns.setHorizontalSpacing(6); btns.setVerticalSpacing(4)
+        btns.setHorizontalSpacing(6)
+        btns.setVerticalSpacing(4)
         self._btn_start = QtWidgets.QPushButton("▶ 开始监测")
         self._btn_start.setEnabled(False)
         self._btn_start.setToolTip("等待历史价差…（载入交易机会后自动请求）")
@@ -964,6 +906,12 @@ class AccountConsole(QtWidgets.QMainWindow):
         btns.addWidget(self._btn_hist, 0, 1)
         btns.addWidget(self._btn_pick, 1, 0)
         btns.addWidget(self._btn_manual, 1, 1)
+        self._btn_reconcile = QtWidgets.QPushButton("核验策略账本")
+        self._btn_reconcile.clicked.connect(self._refresh_managed)
+        self._btn_close_owned = ArmedButton("平策略持仓…")
+        self._btn_close_owned.sig_fire.connect(self._close_owned)
+        btns.addWidget(self._btn_reconcile, 2, 0)
+        btns.addWidget(self._btn_close_owned, 2, 1)
         rv.addLayout(btns)
         rv.addStretch()
         top.addWidget(right)
@@ -1020,6 +968,24 @@ class AccountConsole(QtWidgets.QMainWindow):
     # 顶栏摘要（净值/使用率/tick 时龄，2s 定时 + 事件驱动）
     # ==================================================================
     def _update_header_line(self) -> None:
+        if self._managed_pending and time.monotonic() - self._managed_sent_at > 30:
+            self._stop_monitor()
+            self._lbl_stats.setText("委托响应超时，停止监测；等待回执或重新连接核验账本，禁止自动重发")
+        if self._history_request and time.monotonic() - self._history_requested_at >= 30:
+            self._history_request = None
+            self._btn_start.setEnabled(True)
+            self._lbl_stats.setText("历史请求超时，点击开始监测重试")
+        if self._monitoring and not quotes_ready(self._current_legs or [], self._last_ticks, time.time()):
+            self._stop_monitor()
+            self._append_log("行情过期或腿间时间偏差过大，监测已暂停")
+        if self._session:
+            phase = self._session.state.phase
+            cleaning = phase in (Phase.STOPPING, Phase.FAILED) and not self._session.closed.is_set()
+            self._btn_session.setEnabled(not cleaning)
+            if cleaning:
+                self._btn_session.setText("等待会话清理…")
+            elif self._session.closed.is_set():
+                self._btn_session.setText("连接账户")
         parts: list[str] = []
         if self._last_account:
             equity = _f(self._last_account.get("equity"))
@@ -1038,87 +1004,79 @@ class AccountConsole(QtWidgets.QMainWindow):
             parts.append("会话断开")
         elif self._last_tick_at is not None:
             age = time.time() - self._last_tick_at
-            parts.append(f"tick {age:.0f}s前" + (" ⚠停滞" if age > 10 else ""))
+            ready = quotes_ready(self._current_legs or [], self._last_ticks, time.time())
+            parts.append(f"报价更新 {age:.0f}s前" + (" ⚠行情不可用" if not ready else ""))
         else:
             parts.append("tick 待数据")
         self._info.setText(" · ".join(parts))
 
     def _update_mode(self) -> None:
         paper = self._chk_paper.isChecked()
-        self._lbl_mode.setText("纸面" if paper else "实盘")
+        self._stop_monitor()
+        if self._runner:
+            self._runner.signal.restore_counts({})
+        if not paper:
+            self._refresh_managed()
+        self._show_mode()
+
+    def _show_mode(self):
+        paper = self._chk_paper.isChecked()
+        self._lbl_mode.setText(('图表纸面' if paper else '手动实盘') +
+                               f' | 后台实盘任务 {self._automation_active}')
         self._lbl_mode.setStyleSheet(
-            f"color: {COLORS['UP'] if paper else COLORS['DOWN']}; font-weight: bold;"
+            f"color: {COLORS['UP'] if paper and not self._automation_active else COLORS['DOWN']}; font-weight: bold;"
         )
 
     # ==================================================================
     # 会话管理
     # ==================================================================
     def _start_session(self) -> None:
-        if self._session is not None:
+        try:
+            self._session = self._sessions.connect(self._account)
+        except ValueError as exc:
+            self._append_log(str(exc))
             return
-        self._session = AccountSession(self._ee, self._account, on_exit=self._session_died)
-        self._session.start()
-        self._position_rows = {}
-        self._signals_rows = []
-        self._monitoring = False
-        self._conn_state = "waiting"
-        self._status_pill.set_state("waiting")
-        self._btn_session.setText("断开会话")
+        self._last_ticks.clear()
+        self._last_frame = None
+        self._history_request = None
+        self._hist_ready = False
+        self._on_status(self._session.status_event())
+        for event in self._session.cached_events():
+            {EVENT_ACCOUNT: self._on_account, EVENT_RULES: self._on_rules,
+             EVENT_SWAPS: self._on_swaps, EVENT_AUTOMATION_STATE: self._on_automation}.get(event.type, lambda e: None)(event)
 
     def _toggle_session(self) -> None:
-        """连接/断开状态机（状态不再丢失：断开后可随时重连）。"""
-        if self._session:
-            # 纯 detach：只断接口连接，MT5 终端保持运行（终端由用户手动管理）
+        if self._session and not self._session.closed.is_set():
             self.stop_session_and_close()
         else:
             self._start_session()
 
-    def _session_died(self, name: str) -> None:
-        self._session = None
-        self._monitoring = False
-        self._conn_state = "disconnected"
-        self._status_pill.set_state("disconnected")
-        self._btn_session.setText("连接账户")
-        self._update_header_line()
-
     def stop_session_and_close(self) -> None:
-        """窗口关闭/断开 = 会话结束（后台线程停止，UI 立即响应）。
-
-        会话 stop 含子进程 join（最长 8s），绝不能在 GUI 线程同步做，
-        否则主窗口关闭时控制台会冻结数秒，看起来像"关不掉"。"""
-        session = self._session
-        self._session = None
-        # 先解绑事件桥（防止瞬时事件在窗口销毁后仍投递引发 Signal deleted）
-        for bridge in getattr(self, "_bridges", []):
-            try:
-                self._ee.unregister(bridge.event_type, bridge._on_event)
-            except Exception:
-                pass
-        self._bridges = []
-        if session is not None:
-            def _stop_bg():
-                try:
-                    session.stop(close_terminal=False)
-                except Exception:
-                    pass
-            threading.Thread(
-                target=_stop_bg, name=f"stop-{self.session_name}", daemon=True
-            ).start()
-        self._monitoring = False
-        self._conn_state = "disconnected"
-        self._status_pill.set_state("disconnected")
-        self._btn_session.setText("连接账户")
-        self._update_header_line()
-        if self._on_closed:
-            self._on_closed(self.session_name)
+        """Explicit disconnect; view subscriptions survive reconnect."""
+        self._opp_cancel.set()
+        self._stop_monitor()
+        self._last_ticks.clear()
+        self._last_tick_at = None
+        self._history_request = None
+        self._hist_ready = False
+        self._sessions.disconnect(self.session_name)
+        if self._session:
+            self._on_status(self._session.status_event())
 
     def closeEvent(self, e) -> None:  # noqa: N802
-        # 显式停掉定时器/回调，防关闭后回调已销毁对象
+        self._closed = True
+        self._opp_cancel.set()
+        self._stop_monitor()
         self._conn_timer.stop()
-        flush = getattr(self._chart, "_curve_flush", None)
-        if flush is not None:
-            flush.stop()
-        self.stop_session_and_close()
+        self._chart.dispose()
+        self._toast_mgr.dispose()
+        for bridge in self._bridges:
+            bridge.destroy()
+        self._bridges.clear()
+        if self._on_closed:
+            self._on_closed(self.session_name)
+        # Session remains application-owned; reopening reattaches this view.
+        self.deleteLater()
         super().closeEvent(e)
 
     # ==================================================================
@@ -1127,6 +1085,8 @@ class AccountConsole(QtWidgets.QMainWindow):
     def _bind_events(self) -> None:
         self._bridges = []
         for event_type, slot in (
+            (EVENT_AUTOMATION_STATE, self._on_automation),
+            (EVENT_MANAGED_STATE, self._on_managed),
             (EVENT_STATUS, self._on_status),
             (EVENT_ACCOUNT, self._on_account),
             (EVENT_SWAPS, self._on_swaps),
@@ -1145,7 +1105,8 @@ class AccountConsole(QtWidgets.QMainWindow):
         self._bridges.append(log_bridge)
 
     def _is_self(self, event) -> bool:
-        return isinstance(event.data, dict) and event.data.get("session") == self.session_name
+        return (not self._closed and self._sessions.is_current(event)
+                and event.data.get("session") == self.session_name)
 
     def _sess_repeat(self, fn) -> None:
         if self._session is None:
@@ -1160,21 +1121,42 @@ class AccountConsole(QtWidgets.QMainWindow):
         if not self._is_self(event):
             return
         payload = event.data["payload"]
-        msg = str(payload.get("msg", ""))
-        if payload.get("ok"):
-            self._conn_state = "connected"
-            self._status_pill.set_state("connected")
-            self._btn_session.setText("断开会话")
+        session = self._sessions.get(self.session_name)
+        if payload.get("revision") != session.state.revision:
+            return
+        self._session = session
+        phase = session.state.phase
+        self._automation_panel.set_available(phase == Phase.CONNECTED)
+        previous = self._conn_state
+        self._conn_state = {
+            Phase.CONNECTED: "connected", Phase.CONNECTING: "waiting",
+            Phase.RECONNECTING: "retrying",
+        }.get(phase, "disconnected")
+        self._status_pill.set_state(self._conn_state)
+        self._status_pill.setToolTip(session.state.message)
+        self._btn_session.setText("连接账户" if phase in (Phase.FAILED, Phase.DISCONNECTED)
+                                  else "断开会话")
+        if phase == Phase.CONNECTED and previous != "connected":
+            session.request_rules()
+            session.request_managed_state()
             if self._chk_watch.isChecked():
-                self._sess_repeat(lambda s: s.watch_swaps(self._spin_interval.value()))
+                session.watch_swaps(self._spin_interval.value())
             self._subscribe_legs_cache()
-        else:
-            # worker 处于启动/重试态时不把状态置为失败，避免误判
-            self._conn_state = "retrying"
-            self._status_pill.set_state("retrying")
-            if "进程退出" in msg:
-                self._status_pill.set_state("disconnected")
-                self._conn_state = "disconnected"
+            if self._current_legs:
+                self._request_spread_history_guarded()
+        elif phase != Phase.CONNECTED:
+            self._automation_active = 0
+            self._show_mode()
+            self._opp_cancel.set()
+            self._managed_state = {}
+            self._managed_pending = None
+            self._stop_monitor()
+            self._last_ticks.clear()
+            self._last_account = None
+            self._last_tick_at = None
+            self._last_frame = None
+            self._hist_ready = False
+            self._history_request = None
         self._update_header_line()
 
     def _on_account(self, event) -> None:
@@ -1187,6 +1169,36 @@ class AccountConsole(QtWidgets.QMainWindow):
         if currency:
             self._account_currency = currency
         self._update_header_line()
+
+    def _send_automation(self, message):
+        return bool(self._session and self._session.request_automation(message))
+
+    def _on_automation(self, event):
+        if self._is_self(event):
+            payload = event.data['payload']
+            self._automation_panel.update_state(payload)
+            if 'tasks' in payload:
+                self._automation_active = sum(t['entry_enabled'] or t['exit_enabled'] for t in payload['tasks'])
+                self._show_mode()
+
+    def _automation_seed(self):
+        if not self._current_legs:
+            raise ValueError('请先在交易机会中载入一个组合，再新建后台任务')
+        from ..spreads import build_legs_from_opportunity
+        metadata = {r['symbol']: {'min_volume': r.get('volume_min', .01),
+                                 'volume_step': r.get('volume_step', .01)}
+                    for r in self._rules_cache if r.get('symbol')}
+        if any(x['symbol'] not in metadata for x in self._current_legs):
+            raise ValueError('交易规格尚未到齐，请刷新规则后再创建任务')
+        legs = build_legs_from_opportunity({'legs': self._current_legs}, self._last_ticks,
+                                          self._spin_volume.value(), metadata)
+        spread = self._runner.compute_spread(self._last_ticks) if self._runner and self._last_ticks else None
+        return {'name': ' / '.join(x.symbol for x in legs),
+                'legs': [{'symbol': x.symbol, 'side': x.side, 'volume': x.multiplier} for x in legs],
+                'entry_spread': spread[0] if spread else 0.,
+                'target_layers': self._spin_maxpos.value(),
+                'max_account_lots': self._spin_lot_cap.value(),
+                'max_margin_ratio': self._spin_margin_cap.value() / 100}
 
     def _on_rules(self, event) -> None:
         if not self._is_self(event):
@@ -1215,7 +1227,7 @@ class AccountConsole(QtWidgets.QMainWindow):
         """连接成功后自动生成并载入首个组合（主图立即有数据，无需两步点击）。
 
         机会计算在后台线程跑，载入动作由 _opportunities_ready 在结果到达后接手。"""
-        if self._current_legs or not self._swaps_payload:
+        if self._closed or self._current_legs or not self._swaps_payload:
             return
         self._auto_load_pending = True
         self._generate_opportunities()
@@ -1295,9 +1307,12 @@ class AccountConsole(QtWidgets.QMainWindow):
             )
             return
         payload = self._swaps_payload
+        generation = self._session.generation if self._session else None
         max_legs = self._spin_max_legs.value()
         account_currency = self._account_currency or "USD"
         self._opp_thread = True
+        cancel = threading.Event()
+        self._opp_cancel = cancel
 
         def _run() -> None:
             opps: list[dict] = []
@@ -1309,15 +1324,21 @@ class AccountConsole(QtWidgets.QMainWindow):
                     max_legs=max_legs,
                     cap=100,
                     account_currency=account_currency,
+                    should_cancel=cancel.is_set,
                 )
             except Exception as exc:   # 保持旧行为的容错性：失败不冻结 UI，仅提示
                 opps = []
                 err = exc
             finally:
                 # 结果回到主线程再改 UI（_opportunities / 表格 / 弹窗）
-                self._callin.call.emit(
-                    lambda: self._opportunities_ready(opps, err)
-                )
+                if not self._closed:
+                    try:
+                        self._callin.call.emit(
+                            lambda: self._opportunities_ready(opps, err, generation, cancel.is_set())
+                        )
+                    except RuntimeError:
+                        if not self._closed:
+                            raise
 
         threading.Thread(
             target=_run,
@@ -1326,9 +1347,12 @@ class AccountConsole(QtWidgets.QMainWindow):
         ).start()
 
     def _opportunities_ready(self, opportunities: list[dict],
-                             err: BaseException | None = None) -> None:
+                             err: BaseException | None = None, generation=None, cancelled=False) -> None:
         """后台 generate() 完成后的主线程收尾（原 _generate_opportunities 尾部逻辑）。"""
         self._opp_thread = False
+        if (cancelled or self._closed or not self._session or generation != self._session.generation
+                or self._session.state.phase != Phase.CONNECTED):
+            return
         if err is not None:
             self._auto_load_pending = False
             self._append_log(f"机会计算失败: {err}")
@@ -1428,6 +1452,11 @@ class AccountConsole(QtWidgets.QMainWindow):
             self._set_opportunity(opp)
 
     def _set_opportunity(self, opp: dict) -> None:
+        self._stop_monitor()
+        self._history_request = None
+        self._last_ticks.clear()
+        self._last_frame = None
+        self._btn_start.setEnabled(False)
         self._current_legs = list(opp["legs"])
         self._runner = None    # 重建 runner 以装载新组合
         self._hist_ready = False
@@ -1449,12 +1478,8 @@ class AccountConsole(QtWidgets.QMainWindow):
             for m in opp["legs"]
         ])
         # 关键：订阅组合各腿行情，否则实时价差永远取不到 tick
-        for leg in opp["legs"]:
-            self._ee.put(Event(
-                EVENT_SYMBOL_SUBSCRIBE,
-                {"session": self.session_name, "symbol": leg["symbol"]},
-            ))
-        # 自动请求历史价差（到达后启用"开始监测"并初始化统计；60s 节流防重复拉取）
+        self._subscribe_legs_cache()
+        # 自动请求历史价差（到达后启用"开始监测"；按请求编号校验）
         self._ensure_runner()
         self._request_spread_history_guarded()
         self._tabs.setCurrentWidget(self._tabs.widget(2))   # 载入即切策略控制台
@@ -1478,11 +1503,11 @@ class AccountConsole(QtWidgets.QMainWindow):
 
     @staticmethod
     def _legs_signature(legs: list[dict] | None) -> tuple:
-        """组合签名（symbol/side/weight 四位小数）：用于历史载荷归属校验与
-        分组合节流——历史事件必须与当前载入的组合严格一致才画上。"""
+        """组合签名（symbol/side/weight 精确值）：用于历史载荷归属校验与
+        历史事件还必须匹配当前 request_id 才能进入视图。"""
         return tuple(
             (str(leg.get("symbol", "")), str(leg.get("side", "buy")),
-             round(float(leg.get("weight", 1.0)), 4))
+             float(leg.get("weight", 1.0)))
             for leg in (legs or [])
         )
 
@@ -1490,7 +1515,7 @@ class AccountConsole(QtWidgets.QMainWindow):
         if not self._current_legs:
             QtWidgets.QMessageBox.warning(
                 self, "提示",
-                "尚未选择组合。点击\“选组合…\”从交易机会中选择，"
+                "尚未选择组合。点击“选组合…”从交易机会中选择，"
                 "或到【交易机会】页双击载入。"
             )
             return False
@@ -1508,17 +1533,10 @@ class AccountConsole(QtWidgets.QMainWindow):
         return True
 
     def _current_stats(self) -> dict:
-        """runner 当前统计口径：先验段（live<10 且有先验）用先验 mean/std，
-        否则用滚动窗口 stats；两段口径都带 mean/std 字段。无数据返回 {}。"""
+        """已收盘 M1 滚动统计与 H1 先验平滑混合，无数据返回 {}。"""
         if self._runner is None:
             return {}
-        series = self._runner.series
-        if series.live_points() < 10 and self._runner.prior:
-            return {
-                "mean": self._runner.prior["mean"],
-                "std": self._runner.prior["std"],
-            }
-        return series.stats() or {}
+        return self._runner.current_stats()
 
     def _push_thresholds(self) -> None:
         stats = self._current_stats()
@@ -1554,8 +1572,9 @@ class AccountConsole(QtWidgets.QMainWindow):
         self._spin_k.setValue(float(k))
         self._spin_k.blockSignals(False)
         if self._runner is not None:
-            self._runner.params["k"] = float(k)
-            self._runner.signal.k = float(k)
+            self._runner.params["k"] = self._spin_k.value()
+            self._runner.signal.k = self._spin_k.value()
+        self._push_thresholds()
 
     def _load_history(self) -> None:
         if not self._ensure_runner():
@@ -1563,50 +1582,51 @@ class AccountConsole(QtWidgets.QMainWindow):
         self._request_spread_history_guarded()
 
     def _request_spread_history_guarded(self) -> None:
-        """历史价差请求节流：**按组合签名**分别 60s 节流——
-
-        同一组合 60s 内已发过则跳过；切换到新组合立即放行（否则用户
-        载入新组合时命中上一组合的窗口会跳过需拉的请求，图上
-        长时间滞留旧组合的价差——载入组合**: 先拉新历史**）。"""
-        sig = self._legs_signature(self._cleaned_legs())
-        last = self._hist_req_by_sig.get(sig, 0.0)
-        now = time.time()
-        if now - last < 60.0:
-            self._append_log("同一组合 60 秒内已请求过历史，本次跳过")
+        if not self._session or self._session.state.phase != Phase.CONNECTED:
+            self._append_log("历史请求等待账户连接")
             return
-        self._hist_req_by_sig[sig] = now
-        self._sess_repeat(lambda s: s.request_spread_history(self._cleaned_legs()))
+        if self._history_request and time.monotonic() - self._history_requested_at < 30:
+            return
+        request_id = uuid.uuid4().hex
+        if self._session.request_spread_history(self._cleaned_legs(), request_id):
+            self._history_request = request_id
+            self._history_requested_at = time.monotonic()
+            self._lbl_stats.setText("正在加载历史…")
 
     def _on_spread_history(self, event) -> None:
         if not self._is_self(event) or self._runner is None:
             return
         payload = event.data["payload"]
-        # 载荷归属校验：事件里的 legs 必须与当前组合一致（worker 后台
-        # latest-wins 拉取，旧组合的历史可能晚到）——不匹配丢弃。
-        sig_in = self._legs_signature(payload.get("legs"))
-        if sig_in != self._legs_signature(self._current_legs or []):
-            self._append_log(
-                "已收到过期组合的历史价差（与当前载入组合不一致），已丢弃"
-            )
+        if (payload.get("request_id") != self._history_request
+                or self._legs_signature(payload.get("legs")) != self._legs_signature(self._current_legs)):
             return
-        datasets = payload.get("datasets", {})
-        # 统计先验/长窗极值：H1 全窗（≥1 年）；图表与实时：M1 折线
-        nh1 = len(datasets.get("h1", {}).get("v", []))
-        nm1 = len(datasets.get("m1", {}).get("v", []))
-        self._append_log(
-            f"已加载价差折线：M1 × {nm1} 点（图表）/H1 × {nh1} 点（统计先验）…"
-        )
-        # 顺序固定：归属校验 → 统计先验（H1）→ 图表数据（M1 折线）→
-        # 阈值线 → 极值线 → 位置就绪（窗口状态不做提前置位，避免空图上先蹦阈值线）
-        self._runner.set_history(datasets.get("h1", {}))
-        line = datasets.get("m1") or datasets.get("h1") or {"t": [], "v": []}
-        self._chart.set_series(list(line["t"]), list(line["v"]))
+        self._history_request = None
+        try:
+            if not payload.get("ok", False):
+                raise ValueError(payload.get("error", "历史请求失败"))
+            datasets = payload.get("datasets", {})
+            h1 = datasets.get("h1", {})
+            ht, hv = normalize_series(h1.get("t", []), h1.get("v", []))
+            line = datasets.get("m1") or h1
+            t, v = normalize_series(line.get("t", []), line.get("v", []))
+            if len(ht) < 2 or not len(t):
+                raise ValueError("有效历史不足，无法初始化统计")
+            self._runner.set_history({'t': ht, 'v': hv}, datasets.get('m1'))
+            self._chart.set_series(t, v, preserve_live=True)
+        except (ValueError, TypeError, KeyError) as exc:
+            self._hist_ready = False
+            self._stop_monitor()
+            self._btn_start.setEnabled(True)  # click retries; never starts on invalid history
+            self._lbl_stats.setText(f"历史不可用：{exc}；点击开始监测重试")
+            self._append_log(str(exc))
+            return
         self._push_thresholds()
         self._chart.set_extremes(self._runner.series.extremes())
         self._hist_ready = True
         self._btn_start.setEnabled(True)
         self._btn_start.setToolTip("")
-        self._append_log("历史价差已就绪（可点开始监测）")
+        self._lbl_stats.setText("历史价差已就绪，等待新鲜行情")
+        self._append_log("历史价差已就绪")
 
     # ------------------------------------------------------------------
     # 监测启停（单按钮互换 + Escape）
@@ -1618,11 +1638,18 @@ class AccountConsole(QtWidgets.QMainWindow):
             self._start_monitor()
 
     def _start_monitor(self) -> None:
+        if not self._chk_paper.isChecked():
+            self._append_log('实盘自动执行请使用“后台自动交易”，分别配置并启用入场/出场')
+            self._tabs.setCurrentWidget(self._automation_panel)
+            return
         if not self._ensure_runner():
             return
         if not self._hist_ready:
             self._append_log("历史价差尚未就绪，正在自动重拉…")
             self._request_spread_history_guarded()
+            return
+        if not self._session or self._session.state.phase != Phase.CONNECTED:
+            self._append_log("账户未连接")
             return
         self._monitoring = True
         self._btn_start.setText("■ 停止监测")
@@ -1630,11 +1657,7 @@ class AccountConsole(QtWidgets.QMainWindow):
             f"QPushButton {{ border: 1px solid {COLORS['DOWN']};"
             f" color: {COLORS['DOWN']}; font-weight: bold; }}"
         )
-        self._append_log(
-            "自动网格监测已启动（纸面·分层小单）"
-            if self._chk_paper.isChecked()
-            else "自动网格监测已启动（实盘!! 每层触发即下单）"
-        )
+        self._append_log("自动网格监测已启动（纸面·分层小单）；后台实盘开关独立")
 
     def _stop_monitor(self) -> None:
         if not self._monitoring:
@@ -1645,34 +1668,49 @@ class AccountConsole(QtWidgets.QMainWindow):
         self._append_log("监测已停止")
 
     def _subscribe_legs_cache(self) -> None:
-        legs = getattr(self, "_current_legs", None) or []
-        for leg in legs:
-            self._ee.put(Event(
-                EVENT_SYMBOL_SUBSCRIBE,
-                {"session": self.session_name, "symbol": leg["symbol"]},
-            ))
+        if self._session and self._session.state.phase == Phase.CONNECTED:
+            self._session.set_subscriptions([leg["symbol"] for leg in self._current_legs or []])
 
-    # ------------------------------------------------------------------
-    # live tick / 信号（自动网格分层小单）
-    # ------------------------------------------------------------------
     def _on_tick(self, event) -> None:
-        if not self._is_self(event):
+        if not self._is_self(event) or self._conn_state != "connected":
             return
-        symbol = None
         for item in event.data["payload"]:
-            symbol = item["symbol"]
-            self._last_ticks[symbol] = item
-        self._last_tick_at = time.time()
-        self._update_leg_quotes()
-        if symbol is None or self._runner is None or not self._hist_ready:
+            old = self._last_ticks.get(item["symbol"], {})
+            try:
+                stamp = float(item.get("time_msc", 0) or float(item.get("time", 0)) * 1000)
+                if not math.isfinite(stamp):
+                    continue
+            except (ValueError, TypeError):
+                continue
+            old_stamp = old.get("time_msc", 0) or old.get("time", 0) * 1000
+            if stamp >= old_stamp:
+                self._last_ticks[item["symbol"]] = item
+        legs = self._current_legs or []
+        if not quotes_ready(legs, self._last_ticks, time.time()):
             return
-        result = self._runner.on_tick(self._last_ticks)
+        self._last_tick_at = min(float(self._last_ticks[leg["symbol"]]["time"]) for leg in legs)
+        self._update_leg_quotes()
+        if self._runner is None or not self._hist_ready:
+            return
+        frame = tuple((leg["symbol"], self._last_ticks[leg["symbol"]].get("time_msc"),
+                       self._last_ticks[leg["symbol"]]["time"],
+                       self._last_ticks[leg["symbol"]]["bid"], self._last_ticks[leg["symbol"]]["ask"])
+                      for leg in legs)
+        if frame == self._last_frame:
+            return
+        self._last_frame = frame
+        allow_signal = self._monitoring
+        if not self._chk_paper.isChecked():
+            self._restore_live_counts()
+            allow_signal = (allow_signal and not self._managed_pending
+                            and self._managed_state.get("ready", False)
+                            and not self._managed_state.get("blocked", True))
+        result = self._runner.on_tick(self._last_ticks, emit_signal=allow_signal)
         if result is None:
             return
         if self._monitoring:
             self._handle_strategy(result)
         else:
-            # 未监测：只画实时数据（不触发信号/下单），保证图先于监测就疲惫
             self._apply_chart_tick(result)
 
     def _update_leg_quotes(self) -> None:
@@ -1715,7 +1753,12 @@ class AccountConsole(QtWidgets.QMainWindow):
         signal = result.get("signal")
         if signal:
             ts = dt.datetime.fromtimestamp(result["ts"]).strftime("%H:%M:%S")
-            self._append_signal(ts, signal, result.get("hedge"))
+            self._append_signal(ts, signal, result.get("hedge") or [])
+            if self._chk_paper.isChecked():
+                if signal["action"] == "close":
+                    self._runner.signal.reset_direction(signal["side"])
+            # Live automation belongs to account background tasks. This chart's
+            # legacy Z-score grid is observation/paper only.
 
     def _update_stats_label(self, result: dict) -> None:
         """统计标签（None 安全：extremes 四键可能为 None）。"""
@@ -1742,16 +1785,16 @@ class AccountConsole(QtWidgets.QMainWindow):
             f"价差 {fmt5(result.get('spread'))} | z {fmt2(stats.get('z'))} | "
             f"mean {fmt5(stats.get('mean'))} ± {fmt5(stats.get('std'))}{prior_mark}\n"
             f"{ext_line}\n"
-            f"分层：每层 {vol_per_level:.2f} 手/腿，最多 {self._spin_maxpos.value()} 层/方向"
+            f"分层：每层最重腿 {vol_per_level:.2f} 手，最多 {self._spin_maxpos.value()} 层/方向"
         )
 
     def _append_signal(self, ts: str, signal: dict, hedge) -> None:
-        mode = "paper" if self._chk_paper.isChecked() else "LIVE"
+        mode = "paper" if self._chk_paper.isChecked() else "signal"
         vol_per_level = self._spin_volume.value()
         if signal["action"] == "open":
             remark = (
                 f"第{signal.get('count', 1)}层 · {signal.get('remark', '')}"
-                f" · 本层 {vol_per_level:.2f} 手/腿"
+                f" · 本层最重腿 {vol_per_level:.2f} 手"
             )
         elif signal["action"] == "close":
             remark = f"平 {signal.get('count', 0)} 层（z 回归）"
@@ -1782,12 +1825,12 @@ class AccountConsole(QtWidgets.QMainWindow):
                 {"z": signal.get("z"), "count": signal.get("count")},
             )
         n_open = sum(1 for s in self._signals_rows if s["action"] == "open")
-        self._lbl_mode.setToolTip(f"信号 {len(self._signals_rows)} 条 · open {n_open} 层")
+        self._lbl_mode.setToolTip(f"信号 {len(self._signals_rows)} 条 · 开仓信号 {n_open} 条")
 
     def _manual_entry(self) -> None:
         if not self._ensure_runner():
             return
-        # 手动 = 组合方向补一层小单（不再弹方向选择；进场以自动网格为主）
+        # 手动沿当前组合方向提交一层；与自动监测使用同一归属和风控路径。
         signal = {
             "action": "open", "side": "buy", "count": 1,
             "level": (self._runner.series.stats() or {}).get("last", 0), "z": 0,
@@ -1797,13 +1840,23 @@ class AccountConsole(QtWidgets.QMainWindow):
             self._execute_live(signal)
 
     def _execute_live(self, signal: dict) -> None:
-        """实盘执行（每个信号 = 一次价差算法请求，撕塔算法在 worker 内部两阶段闭）。
+        """Submit an owned basket or close the confirmed strategy direction.
 
-        - 腿的带方向倍数经 USD 中性权重自动计算（不手动管理价差）；
-        - active leg（点差最宽）先吃单，成交回调后其余腿立即对冲（vnpy
-          SpreadTakerAlgo 语义）；
-        - 每层触发一次算法事件（逐步小单，不会一次满仓）。
+        Actual broker execution, risk checks and durable ownership live in the
+        worker. Emitting a signal does not itself confirm a filled layer.
         """
+        if self._managed_pending:
+            self._append_log("已有未确认委托，等待回执后再操作")
+            return
+        if not self._session or self._session.state.phase != Phase.CONNECTED:
+            self._append_log("未执行：账户未连接")
+            return
+        if signal.get("action") == "close":
+            self._submit_managed("close", strategy_key(self._current_legs), signal["side"], [])
+            return
+        if signal.get("action") != "open" or not quotes_ready(self._current_legs or [], self._last_ticks, time.time()):
+            self._append_log("未执行：组合行情过期或操作无效")
+            return
         from ..spreads import build_legs_from_opportunity
 
         legs = self._current_legs or []
@@ -1835,18 +1888,74 @@ class AccountConsole(QtWidgets.QMainWindow):
             opp, quotes, float(self._spin_volume.value()), meta,
         )
         payload = [
-            {"symbol": l.symbol, "side": l.side, "volume": l.multiplier}
-            for l in elegs
+            {"symbol": leg.symbol, "side": leg.side, "volume": leg.multiplier}
+            for leg in elegs
         ]
-        self._ee.put(Event(EVENT_ALGO_REQUEST, {
-            "session": self.session_name,
-            "legs": payload,
-            "comment": f"strat-{signal['action']}",
-        }))
-        self._append_log(
-            "价差算法已下发（" + ("卖" if flip else "买") + "）: "
-            + " | ".join(f"{l.side}:{l.symbol}×{l.multiplier}" for l in elegs)
-        )
+        self._submit_managed("open", strategy_key(legs), signal["side"], payload)
+
+    def _submit_managed(self, operation, strategy, direction, legs):
+        if self._chk_paper.isChecked():
+            self._append_log("纸面模式不会发送实盘委托")
+            return
+        if self._managed_pending or not self._session or self._session.state.phase != Phase.CONNECTED:
+            self._append_log("会话未就绪或已有未确认委托")
+            return
+        request_id = uuid.uuid4().hex
+        message = {"request_id": request_id, "operation": operation,
+                   "strategy_id": strategy, "direction": direction, "legs": legs,
+                   "max_layers": self._spin_maxpos.value(),
+                   "max_account_lots": self._spin_lot_cap.value(),
+                   "max_margin_ratio": self._spin_margin_cap.value() / 100}
+        if self._session.request_managed_trade(message):
+            self._managed_pending = request_id
+            self._managed_sent_at = time.monotonic()
+            self._append_log(f"受管{operation}请求已提交，等待实际成交：{request_id}")
+
+    def _refresh_managed(self):
+        if self._session and not self._managed_pending:
+            self._session.request_managed_state()
+
+    def _restore_live_counts(self):
+        if not self._runner or not self._current_legs:
+            return
+        key = strategy_key(self._current_legs)
+        counts = {side: sum(b["strategy"] == key and b["direction"] == side
+                            for b in self._managed_state.get("batches", [])) for side in ("buy", "sell")}
+        self._runner.signal.restore_counts(counts)
+
+    def _on_managed(self, event):
+        if not self._is_self(event):
+            return
+        state = event.data["payload"]
+        self._managed_state = state
+        if state.get("request_id") == self._managed_pending:
+            self._managed_pending = None
+        if not self._chk_paper.isChecked():
+            self._restore_live_counts()
+        if state.get("error") or state.get("blocked") or not state.get("ready"):
+            if not self._chk_paper.isChecked():
+                self._stop_monitor()
+            details = state.get("error") or "; ".join(b.get("error", "") for b in state.get("batches", []) if b.get("error"))
+            self._append_log(f"策略账本未就绪或存在异常：{details}")
+        else:
+            self._append_log(f"策略账本已核验：{len(state.get('batches', []))} 个持仓批次；不会自动恢复监测")
+
+    def _close_owned(self):
+        self._stop_monitor()
+        groups = sorted({(b["strategy"], b["direction"]) for b in self._managed_state.get("batches", [])
+                         if not b['strategy'].startswith('auto:')})
+        if not groups:
+            self._append_log("没有已知手动策略持仓；后台任务请在“后台自动交易”中退出")
+            return
+        labels = []
+        for index, (key, side) in enumerate(groups):
+            batches = [b for b in self._managed_state.get("batches", []) if b["strategy"] == key and b["direction"] == side]
+            description = " + ".join(f"{x['symbol']} {'买' if x['side'] == 'buy' else '卖'}" for x in batches[0]['legs'])
+            labels.append(f"{index + 1}. {description} · {len(batches)}个批次")
+        label, ok = QtWidgets.QInputDialog.getItem(self, "平策略持仓", "只平选定策略方向的已核验持仓：", labels, 0, False)
+        if ok:
+            key, side = groups[labels.index(label)]
+            self._submit_managed("close", key, side, [])
 
     # ------------------------------------------------------------------
     # 持仓（原始持仓，不合并）/ 成交记录 / 日志
@@ -1857,9 +1966,11 @@ class AccountConsole(QtWidgets.QMainWindow):
         if not self._is_self(event):
             return
         raw = event.data["payload"]
-        self._sym_pnl = {
-            p["symbol"]: _f(p.get("profit")) for p in raw if p.get("symbol")
-        }
+        self._sym_pnl = {}
+        for position in raw:
+            symbol = position.get("symbol")
+            if symbol:
+                self._sym_pnl[symbol] = self._sym_pnl.get(symbol, 0.0) + _f(position.get("profit"))
         self._update_leg_quotes()
         merged: dict[str, dict] = {}
         for p in raw:
@@ -1903,16 +2014,11 @@ class AccountConsole(QtWidgets.QMainWindow):
             return
         payload = event.data["payload"]
         stage = payload.get("stage", "")
-        color = {
-            "active": COLORS["ACCENT"], "hedge": COLORS["WARN"],
-            "done": COLORS["UP"], "failed": COLORS["DOWN"],
-            "stalled": COLORS["WARN"],
-            "audit_ok": COLORS["UP"], "audit_mismatch": COLORS["DOWN"],
-        }.get(stage, COLORS["TXT_MUTED"])
         self._append_log(
             f"[价差算法 {payload.get('algoid')}] [{stage}] {payload.get('msg')}"
         )
-        if stage == "failed":
+        if stage in ("failed", "stalled", "audit_mismatch", "partial"):
+            self._stop_monitor()
             QtWidgets.QMessageBox.critical(
                 self, "价差算法失败",
                 f"{payload.get('msg')}\n\n存在裸腿暴露风险，请立即检查持仓！"

@@ -17,6 +17,9 @@ class SwapSnapshotService:
     def start(self, engine) -> None:
         engine.register(EVENT_SWAPS, self._on_swaps)
 
+    def stop(self, engine) -> None:
+        engine.unregister(EVENT_SWAPS, self._on_swaps)
+
     def _on_swaps(self, event) -> None:
         payload = event.data.get("payload", {})
         session = event.data.get("session", "")
@@ -30,3 +33,33 @@ class SwapSnapshotService:
 
                 traceback.print_exc()
                 _ = exc
+
+
+class ExecutionJournalService:
+    """Persist actual worker reports even while every account console is closed.
+
+    This is an execution journal, not a strategy position-ownership ledger.
+    """
+    def __init__(self, db: Database) -> None:
+        self._db = db
+
+    def start(self, engine) -> None:
+        from ..constants import EVENT_ORDER_RESULT, EVENT_SPREAD_ALGO
+        for kind in (EVENT_ORDER_RESULT, EVENT_SPREAD_ALGO):
+            engine.register(kind, self._record)
+
+    def stop(self, engine) -> None:
+        from ..constants import EVENT_ORDER_RESULT, EVENT_SPREAD_ALGO
+        for kind in (EVENT_ORDER_RESULT, EVENT_SPREAD_ALGO):
+            engine.unregister(kind, self._record)
+
+    def _record(self, event) -> None:
+        import datetime as dt
+        data = event.data
+        payload = data.get("payload") or {}
+        request = payload.get("request") or {}
+        self._db.insert_trade(
+            data["session"], dt.datetime.now(dt.timezone.utc).isoformat(),
+            "live", "execution", request.get("algoid", payload.get("algoid", "")),
+            [], {"event": event.type, "generation": data.get("generation"), **payload},
+        )
