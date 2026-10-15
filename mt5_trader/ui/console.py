@@ -1596,13 +1596,14 @@ class AccountConsole(QtWidgets.QMainWindow):
         self._append_log(
             f"已加载价差折线：M1 × {nm1} 点（图表）/H1 × {nh1} 点（统计先验）…"
         )
+        # 顺序固定：归属校验 → 统计先验（H1）→ 图表数据（M1 折线）→
+        # 阈值线 → 极值线 → 位置就绪（窗口状态不做提前置位，避免空图上先蹦阈值线）
         self._runner.set_history(datasets.get("h1", {}))
-        self._hist_ready = True
-        # 图表（纯折线）：优先 M1；worker 未给 M1 时回退 H1
         line = datasets.get("m1") or datasets.get("h1") or {"t": [], "v": []}
         self._chart.set_series(list(line["t"]), list(line["v"]))
         self._push_thresholds()
         self._chart.set_extremes(self._runner.series.extremes())
+        self._hist_ready = True
         self._btn_start.setEnabled(True)
         self._btn_start.setToolTip("")
         self._append_log("历史价差已就绪（可点开始监测）")

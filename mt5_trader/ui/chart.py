@@ -1,17 +1,16 @@
-"""可复用价差图表组件（pyqtgraph）。
+"""确定性实时价差折线图（v3：固定窗口 / 显式坐标 / 零交互状态机）。
 
-职责：
-- 展示历史价差序列 + 均值/±kσ 阈值/网格层间阈值/长周期极值；
-- 上下阈值线可拖动，拖动上阈值时通过 sig_k_changed 发出新 k 值；
-- 十字光标跟随鼠标（时间/价差值）。
+设计原则——解决历史所有图表问题的根本方案：
+- 数据模型单一：恒定 numpy 缓冲 (t, v)，只追加写入 + 脏标记；
+- 视图完全显式：每次重绘用 setXRange/setYRange 直接量度"最近 N 根"窗口；
+  **不用 autoRange、不用 setLimits、不响应拖拽/滚轮**（内部零状态机，
+  pyqtgraph 的 setRange"a/b < lmn 平移回弹"等坑不再有入口）；
+- 重绘统一走 250ms 合并定时器；数据替换/窗口切换立即重绘；
+- 无科学计数法（_FixedFmtAxis 定点小数轴）；十字光标纯只读、节流；
+- 阈值线可拖动（拖动→sig_k_changed 反写 k），极值线只读。
 
-数据窗口口径：
-- 数据窗口完全由调用方控制（set_series 全量替换 / append_point 增点），
-  本组件内部不做任何滑动窗口裁剪，调用方自行决定保留多少点。
-
-配色与主题（theme.Cloud COLORS）对齐：
-- 背景 #12161d（BG_TABLE）、网格 #202836（GRID）、价差/均值 #4d8df0（ACCENT）、
-  上阈值 #ea3943（DOWN）、下阈值 #16c784（UP）、极值 #f0b90b（WARN）。
+旧接口兼容：set_candles / append_candle_tick / set_candles_visible 保留为 no-op
+（K 线已退役，折线为唯一视觉）。
 """
 
 from __future__ import annotations
@@ -25,103 +24,112 @@ import numpy as np
 import pyqtgraph as pg
 from PySide6 import QtCore, QtGui, QtWidgets
 
-# 本组件固定用色（与 theme.py 调色板 Token 同值，此处独立常量避免引入主题耦合）
 _BG = "#12161d"
-_GRID = "#202836"
 _SPREAD = "#4d8df0"
 _MEAN = "#4d8df0"
-_K_UP = "#ea3943"     # 上阈值 / 卖出进场方向
-_K_DOWN = "#16c784"   # 下阈值 / 买入进场方向
+_K_UP = "#ea3943"     # 上阈值 / 卖出进场
+_K_DOWN = "#16c784"   # 下阈值 / 买入进场
 _EXTREME = "#f0b90b"
 _CROSS = (255, 255, 255, 70)
 
-
-_DAY = 86_400.0
-
-
-_H1 = 3600.0   # （历史遗留默认秒宽；M1=60，实际桶宽由 set_series 从数据自动推导）
+_H1 = 3600.0    # 默认桶宽（秒），实际由 set_series 从数据自动推导
+_REDRAW_MS = 250   # 重绘合并节流
 
 
 def _fixed_ticks(values: list[float], spacing: float) -> list[str]:
-    """定点小数刻度文本（根除科学计数法）。
-
-    小数位数由整定间隔 spacing 推导：spacing≈2e-5 → 5 位，
-    绝不让 Qt 走 str/吧 scientific route。插值律：dec = ceil(-log10(spacing))。
-    过大 spacing 用整数（补 0 位）；与 0 完全重叠时按数值特异性容衲。"""
+    """定点小数刻度文本（根除科学计数法）。小数位由 spacing 幂推导。"""
     if not values:
         return []
     sp = abs(float(spacing)) if spacing else 1.0
-    if not (sp > 0) or not (sp == sp):   # nan/inf 防护
+    if not (sp > 0) or not (sp == sp):
         sp = 1.0
-    import math as _m
     if sp >= 1.0:
         dec = 0
     else:
         try:
-            dec = min(10, max(0, int(_m.ceil(-_m.log10(sp)))))
+            dec = min(10, max(0, int(math.ceil(-math.log10(sp)))))
         except (ValueError, OverflowError):
             dec = 5
     out = [f"{float(v):.{dec}f}" for v in values]
-    # 去尾零（保可读性）：'0.00020'→'0.0002'、'-0.000000'→'0'
     return [s.rstrip("0").rstrip(".") if "." in s else s for s in out]
 
 
 class _FixedFmtAxis(pg.AxisItem):
-    """定点小数数值轴：根除科学计数法（pyqtgraph 默认 tick 对
-    1e-4 量级值会走 e-枚计法）。spacing 精度自动适应缩放层级。"""
+    """定点小数数值轴（pyqtgraph 默认对 1e-4 量级值会走 e-记数法）。"""
 
     def tickStrings(self, values, scale, spacing):  # noqa: N802
         if scale and scale != 1.0:
             values = [v / scale for v in values]
         return _fixed_ticks(values, spacing)
-_VIEW_BARS = 1200   # 载入后默认显示的最近数据点数（更早历史可拖动/缩放查看）
+
+
+# 窗口选择（秒）："全部" 表示显示缓冲内所有数据
+_WINDOW_CHOICES: list[tuple[str, float | None]] = [
+    ("近1小时", 3600.0),
+    ("近8小时", 8 * 3600.0),
+    ("近24小时", 24 * 3600.0),
+    ("近3天", 3 * 86400.0),
+    ("近7天", 7 * 86400.0),
+    ("全部", None),
+]
 
 
 class SpreadChart(QtWidgets.QWidget):
-    """价差序列图（pyqtgraph PlotWidget 封装，可嵌入任意策略台/页面）。"""
+    """价差实时折线图（确定性窗口：下拉选择时段，零拖拽/零缩放状态）。
 
-    sig_k_changed = QtCore.Signal(float)  # 用户拖动上阈值线 -> 发出新的 k 值
+    对外接口（与 console 完全兼容）：
+    - sig_k_changed(k)：拖动上阈值线 → 反写 k；
+    - set_series(t, v) / append_point(t, v)/clear_series()：数据；
+    - set_thresholds(...)/set_extremes(...)：参考线；
+    - set_candles/append_candle_tick/set_candles_visible：no-op（K 线退役）。
+    """
+
+    sig_k_changed = QtCore.Signal(float)
 
     def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent)
 
-        # 图形状态
-        self._t: list[float] = []
-        self._v: list[float] = []
-        # 恒定预分配 numpy 缓冲（容量按需倍增）：_redraw/setData 只发缓冲切片
-        # [self._buf_t[:n], self._buf_v[:n]]，避免每次从 Python list 重建
-        # np 数组；_t/_v 仍保留供 bisect 十字光标与 pending 逻辑使用。
-        self._buf_t: np.ndarray = np.empty(0, dtype=float)
-        self._buf_v: np.ndarray = np.empty(0, dtype=float)
+        # ---- 数据（唯一真源：两个平行 numpy 缓冲，只追加） ----
+        self._buf_t = np.empty(0, dtype=float)
+        self._buf_v = np.empty(0, dtype=float)
+        self._bar_sec = _H1          # 桶宽（set_series 从相邻时间差推导）
+        self._window_sec = 8 * 3600.0   # 显式视窗（秒）；"全部"时为 None
+        self._curve_dirty = False
+        # 阈值参数默认值（先于 set_thresholds 的首绘不能裸访问）
         self._mean = 0.0
         self._std = 1e-12
         self._k = 2.0
         self._grid = 0.5
         self._levels = 3
-        self._curve_dirty = False
-        self._bar_sec = _H1   # 当前蜡烛桶宽（秒）；set_candles 跟随数据推导（M1=60）
+        self._thr_sig = None
+        self._ext_sig = None
 
+        # ---- 顶部条：窗口选择 + 图例说明 ----
         lay = QtWidgets.QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(0)
 
-        # 图例说明条（不能用 pg LegendItem：pyqtgraph 0.14 的 ItemSample.paint
-        # 直接取 item.opts，对 InfiniteLine/自绘蜡烛会 AttributeError →
-        # Qt 渲染期异常风暴 → 段错误；且此前 PlotWidget 从未 addWidget 进布局，
-        # 导致整个图表一曲空白灰底不渲染）。用顶部 QLabel 图例代替。
+        top = QtWidgets.QHBoxLayout()
+        top.setContentsMargins(4, 2, 4, 0)
+        self._win_combo = QtWidgets.QComboBox(self)
+        for label, _sec in _WINDOW_CHOICES:
+            self._win_combo.addItem(label)
+        self._win_combo.setCurrentIndex(1)   # 默认 近8小时
+        self._win_combo.currentIndexChanged.connect(self._on_window_changed)
+        top.addWidget(self._win_combo)
+        top.addStretch(1)
         self._legend_label = QtWidgets.QLabel(
-            '<span style="color:#4d8df0">— 价差（M1 合成）</span>&nbsp;&nbsp;&nbsp;'
-            '<span style="color:#c8cfda">— 均值</span>&nbsp;&nbsp;&nbsp;'
-            '<span style="color:#ea3943">─ 上阈值（拖动调 k）</span>&nbsp;&nbsp;&nbsp;'
-            '<span style="color:#16c784">─ 下阈值</span>&nbsp;&nbsp;&nbsp;'
+            '<span style="color:#4d8df0">— 价差（M1合成）</span>&nbsp;&nbsp;'
+            '<span style="color:#c8cfda">─ 均值</span>&nbsp;&nbsp;'
+            '<span style="color:#ea3943">─ 上阈值（拖动调k）</span>&nbsp;&nbsp;'
+            '<span style="color:#16c784">─ 下阈值</span>&nbsp;&nbsp;'
             '<span style="color:#f0b90b">·· 极值</span>'
         )
         self._legend_label.setTextFormat(QtCore.Qt.RichText)
-        self._legend_label.setStyleSheet(
-            f"color:#c8cfda; background:{_BG}; padding:1px 4px; font-size:11px;"
-        )
-        lay.addWidget(self._legend_label)
+        top.addWidget(self._legend_label)
+        lay.addLayout(top)
 
+        # ---- 主图：轴固定（底=日期，左=定点小数） ----
         self._plot = pg.PlotWidget(
             axisItems={"bottom": pg.DateAxisItem(orientation="bottom"),
                        "left": _FixedFmtAxis(orientation="left")}
@@ -132,16 +140,17 @@ class SpreadChart(QtWidgets.QWidget):
         self._pl.showGrid(x=True, y=True, alpha=0.15)
         self._pl.setDownsampling(mode="peak")
         self._pl.setClipToView(True)
-        self._pl.showButtons()
         self._vb = self._pl.vb
+        # 关键：禁用图内 pan/zoom —— 视图 100% 由重绘显式设定，无隐藏状态
+        self._vb.setMouseEnabled(x=False, y=False)
 
-        # ---- 序列与阈值图形 ----
+        # ---- 序列与参考线（全部静态，生命周期=widget） ----
         self._curve_spread = self._plot.plot(
             pen=pg.mkPen(_SPREAD, width=1.4), name="价差", antialias=False
         )
         self._curve_spread.setDownsampling(method="peak")
         self._curve_spread.setClipToView(True)
-        self._curve_spread.setZValue(5)   # M1 蜡烛半透明墙会遮线：线浮上层
+        self._curve_spread.setZValue(5)
         self._curve_mean = self._plot.plot(
             pen=pg.mkPen(_MEAN, width=1, style=QtCore.Qt.DashLine),
             name="均值", antialias=False,
@@ -160,161 +169,116 @@ class SpreadChart(QtWidgets.QWidget):
         self._line_lower.sigDragged.connect(self._on_lower_dragged)
         self._plot.addItem(self._line_lower)
 
-        # 网格层间阈值线（DotLine 细线，动态重建）
         self._tier_items: list[pg.InfiniteLine] = []
+        self._thr_sig = None
 
-
-        # 长周期极值线 + 文本
+        # 长周期极值线 + 注记
         self._extreme_up = pg.InfiniteLine(
-            pos=0.0, angle=0, movable=False, pen=pg.mkPen(_EXTREME, width=1, style=QtCore.Qt.DotLine)
-        )
+            pos=0.0, angle=0, movable=False,
+            pen=pg.mkPen(_EXTREME, width=1, style=QtCore.Qt.DotLine))
         self._extreme_dn = pg.InfiniteLine(
-            pos=0.0, angle=0, movable=False, pen=pg.mkPen(_EXTREME, width=1, style=QtCore.Qt.DotLine)
-        )
-        self._extreme_up.hide()
-        self._extreme_dn.hide()
+            pos=0.0, angle=0, movable=False,
+            pen=pg.mkPen(_EXTREME, width=1, style=QtCore.Qt.DotLine))
+        self._extreme_up.hide(); self._extreme_dn.hide()
         self._plot.addItem(self._extreme_up)
         self._plot.addItem(self._extreme_dn)
-        self._extreme_legend_item: pg.InfiniteLine | None = None
+        self._extreme_legend_item = None
         self._extreme_legend_label = "全窗极值"
+        self._ext_sig = None
         self._extreme_text = pg.TextItem("", color=_EXTREME, anchor=(0, 0))
         self._vb.addItem(self._extreme_text)
 
-        # ---- 十字光标 ----
+        # ---- 十字光标（只读、节流） ----
         self._cross_v = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen(_CROSS, width=1))
         self._cross_h = pg.InfiniteLine(angle=0, movable=False, pen=pg.mkPen(_CROSS, width=1))
-        for item in (self._cross_v, self._cross_h):
-            self._plot.addItem(item)
-            item.hide()
+        for it in (self._cross_v, self._cross_h):
+            self._plot.addItem(it)
+            it.hide()
         self._cross_text = pg.TextItem("", color="#dde3ec", anchor=(1, 1))
         self._cross_text.setZValue(30)
         self._vb.addItem(self._cross_text)
         self._cross_text.hide()
-        self._cross_bucket = None   # 最近光标所在 H1 桶（文本重排节流）
-        self._cross_last = 0.0      # 上次文本重排的单调钟时刻（时间维度节流）
-        self._cross_pending = False   # 跨桶后尚未重排的待显示项
-        self._cross_flush_scheduled = False
-        self._last_scene_pos = None
+        self._cross_last = 0.0
 
         self._plot.scene().sigMouseMoved.connect(self._on_mouse_moved)
-        # 实时曲线 setData 限频定时器（200ms）；一欧几中的 flush 全量重设
-        self._curve_flush = QtCore.QTimer(self)
-        self._curve_flush.setSingleShot(True)
-        self._curve_flush.timeout.connect(self._flush_curve)
-        self._refresh_limits()
+
+        # ---- 重绘合并定时器（唯一重绘入口） ----
+        self._redraw_timer = QtCore.QTimer(self)
+        self._redraw_timer.setSingleShot(True)
+        self._redraw_timer.timeout.connect(self._on_redraw_tick)
 
     # ==================================================================
-    # 数据接口（窗口由调用方控制）
+    # 数据接口（顺序约定：set_series 全量替换 → append_point 增点 → 重绘）
     # ==================================================================
     def set_series(self, t: list[float], v: list[float]) -> None:
-        """历史全量替换：t=时间戳(s)，v=价差折线点（M1 合成收盘）。
-
-        数据一次写入恒定预分配 numpy 缓冲（容量不足才倍增），
-        _redraw 只发缓冲切片，不再每次从 list 重建 np 数组。
-        桶宽（_bar_sec）从相邻时间差自动推出（M1=60、H1=3600），
-        用于默认视窗宽度计算与批量聚合提示。"""
-        t_list = [float(x) for x in (t or [])]
-        v_list = [float(x) for x in (v or [])]
-        n = min(len(t_list), len(v_list))
-        # 折线桶宽不再依赖蜡烛：从相邻时间差推导（等距取样即周期）
-        if n >= 2 and t_list[1] > t_list[0]:
-            self._bar_sec = float(t_list[1] - t_list[0])
-        self._buf_ensure(n)
-        self._buf_t[:n] = t_list[:n]
-        self._buf_v[:n] = v_list[:n]
-        self._t = t_list
-        self._v = list(v_list[:n])
-        self._redraw()
-        self._autorange_once()
-
-    def _buf_ensure(self, n: int) -> None:
-        """恒定缓冲容量保证 >= n：容量按需倍增，够用时复用不重分配。"""
-        cap = len(self._buf_t)
-        if n <= cap:
-            return
-        new_cap = cap or 128
-        while new_cap < n:
-            new_cap *= 2
-        self._buf_t = np.empty(new_cap, dtype=float)
-        self._buf_v = np.empty(new_cap, dtype=float)
+        """历史全量替换（M1/H1 折线点）。桶宽从相邻时间差自动推导。"""
+        t_l = [float(x) for x in (t or [])]
+        v_l = [float(x) for x in (v or [])]
+        n = min(len(t_l), len(v_l))
+        if n >= 2 and t_l[1] > t_l[0]:
+            self._bar_sec = float(t_l[1] - t_l[0])
+        self._buf_t = np.array(t_l[:n], dtype=float)
+        self._buf_v = np.array(v_l[:n], dtype=float)
+        self._redraw_now()
 
     def append_point(self, t: float, v: float) -> None:
-        """live 增点（追加）；setData 限频 200ms + 视图自动跟随右缘（可拖动打断）。"""
-        t_f = float(t)
-        v_f = float(v)
-        self._t.append(t_f)
-        self._v.append(v_f)
-        n = len(self._t)
-        self._buf_ensure(n)
-        self._buf_t[n - 1] = t_f
-        self._buf_v[n - 1] = v_f
-        self._follow_right_edge(t_f)
-        self._curve_dirty = True
-        if not self._curve_flush.isActive():
-            self._curve_flush.start(200)
-
-    def _follow_right_edge(self, t_latest: float) -> None:
-        """视图跟随：仅当用户当前正看着最右端（右缘差 latest ≤ 2 个桶宽）
-        时才把窗口平移到最新点；手动拖/缩放到老时段则不跟随（不打断浏览）。
-
-        setXRange 前先刷新 limits（xMax 追最新数据+pad），避免请求的右缘
-        被 pyqtgraph 的 mn<lmn 平移回弹（_window 平移的坑已定位：limits
-        下限锁在旧 x_lo - pad_x 时任何右移都会被弹回起点，左界用 None 已解）。"""
-        try:
-            xr, _yr = self._vb.viewRange()
-            right = xr[1]
-            bar = max(self._bar_sec, 1.0)
-            if t_latest - right <= bar * 2.0:   # 用户在看最新段 → 平移
-                self._refresh_limits()          # 同步 xMax 至最新数据包络
-                span = right - xr[0]
-                lead = bar * 5.0                # 右缘留 5 个桶宽空白
-                self._vb.setXRange(t_latest + lead - span, t_latest + lead,
-                                   padding=0)
-        except Exception:
+        """live 增点：写缓冲 + 轻量跟随奖励（右缘自动含最新点）。"""
+        t_f, v_f = float(t), float(v)
+        if self._buf_t.size and t_f <= float(self._buf_t[-1]):
+            # 过期/同刻点直接更新末值（live 重票场景），不追加
+            self._buf_v[-1] = v_f
+            self._schedule_redraw()
+            return
+        n = self._buf_t.size
+        self._buf_t = np.append(self._buf_t, t_f)
+        self._buf_v = np.append(self._buf_v, v_f)
+        if n % 512 == 0:
             pass
+        self._schedule_redraw()
 
-    def _flush_curve(self) -> None:
+    def _schedule_redraw(self) -> None:
+        if not self._redraw_timer.isActive():
+            self._redraw_timer.start(_REDRAW_MS)
+
+    def _on_redraw_tick(self) -> None:
         if self._curve_dirty:
             self._curve_dirty = False
-            self._redraw()
-
-    # ==================================================================
-    # K 线接口（已退役：折线方案；保留为 no-op 以防历史调用点断链）
-    # ==================================================================
-    def set_candles(self, t, o, h, l, c) -> None:  # noqa: N803
-        """历史蜡烛全量替换：K 线已退役（折线方案），保留接口为 no-op。"""
-        return
-
-    def append_candle_tick(self, ts: float, price: float) -> None:
-        """live tick 蜡烛聚合：K 线已退役，保留接口为 no-op（实时走 append_point）。"""
-        return
-
-    def set_candles_visible(self, visible: bool) -> None:
-        """K 线可见性开关：K 线已退役，保留接口为 no-op。"""
-        return
+        self._redraw_now()
 
     def clear_series(self) -> None:
-        """清空序列并隐藏依赖数据的标记。"""
-        self._t.clear()
-        self._v.clear()
-        # 缓冲长度同步：切片窗口归零（已分配容量保留，避免反复申请/释放）
+        """清空序列并隐藏全部依赖数据的标记。"""
+        self._buf_t = np.empty(0, dtype=float)
+        self._buf_v = np.empty(0, dtype=float)
+        self._curve_dirty = False
         self._extreme_text.setText("")
         self._cross_text.hide()
         self._cross_v.hide()
         self._cross_h.hide()
-        self._redraw()
+        for line in (self._curve_spread, self._curve_mean):
+            line.clear()
+        self._extreme_up.hide()
+        self._extreme_dn.hide()
 
+    # ==================================================================
+    # K 线已退役（保留接口 no-op，防历史调用点断链）
+    # ==================================================================
+    def set_candles(self, t, o, h, l, c) -> None:  # noqa: N803
+        return
+
+    def append_candle_tick(self, ts: float, price: float) -> None:
+        return
+
+    def set_candles_visible(self, visible: bool) -> None:
+        return
+
+    # ==================================================================
+    # 参考线（阈值/层间/极值）
+    # ==================================================================
     def set_thresholds(
         self, mean: float, std: float, k: float,
         grid: float, levels: int, show_levels: bool = True,
     ) -> None:
-        """更新统计参考线：均值、±kσ 可拖动线、网格层间阈值线。
-
-        :param mean/std: 统计均值与标准差（实时窗口或先验，口径由调用方给）;
-        :param k: 基础阈值倍数（拖动上阈值线时按 (pos-mean)/std 反算）;
-        :param grid/levels: 网格步进 σ 与层数（层间线画 i=1..levels-1，避免与基础线重叠）;
-        :param show_levels: 是否显示层间阈值线。
-        """
+        """均值线、±kσ 可拖动线、层间阈值线。参数未变早退（tick 级滚动调用）。"""
         self._mean = float(mean)
         self._std = max(float(std), 1e-12)
         self._k = float(k)
@@ -323,56 +287,45 @@ class SpreadChart(QtWidgets.QWidget):
 
         upper = self._mean + self._k * self._std
         lower = self._mean - self._k * self._std
-        # 参数与显示未变：只挪两根可拖线位置，不重建层间线（tick 逐撞同理），
-        # 否则每 tick 重建 InfiniteLine 会让拖动/移动明显卡顿。
         sig = (self._mean, self._std, self._k, self._grid,
                self._levels, bool(show_levels))
-        if sig == getattr(self, "_thr_sig", None):
+        if sig == self._thr_sig:
             with QtCore.QSignalBlocker(self._line_upper):
                 self._line_upper.setPos(upper)
             with QtCore.QSignalBlocker(self._line_lower):
                 self._line_lower.setPos(lower)
             return
         self._thr_sig = sig
-        # 程序化移动时屏蔽拖动信号，避免误发 sig_k_changed
+
         with QtCore.QSignalBlocker(self._line_upper):
             self._line_upper.setPos(upper)
         with QtCore.QSignalBlocker(self._line_lower):
             self._line_lower.setPos(lower)
 
-        # 层间阈值：mean ± (k + i*grid)·std，i=1..levels-1
         for item in self._tier_items:
             self._plot.removeItem(item)
         self._tier_items.clear()
         if show_levels:
             for i in range(1, self._levels):
-                level_z = self._k + i * self._grid
                 for value, color in (
                     (upper + i * self._grid * self._std, _K_UP),
                     (lower - i * self._grid * self._std, _K_DOWN),
                 ):
                     line = pg.InfiniteLine(
                         pos=value, angle=0, movable=False,
-                        pen=pg.mkPen(color, width=1, style=QtCore.Qt.DotLine),
-                    )
+                        pen=pg.mkPen(color, width=1, style=QtCore.Qt.DotLine))
                     self._plot.addItem(line)
                     self._tier_items.append(line)
-        self._refresh_limits()
 
     def set_extremes(self, extremes: dict, label: str = "全窗极值") -> None:
-        """设置长周期极值线：max_1y/min_1y/max_6m/min_6m（值缺数据为 None）。
-
-        画两根水平线（全部极值中的最大/最小，DotLine #f0b90b），
-        左上角 TextItem 列出四个值，缺数据显示 "-"。
-        """
+        """长窗极值线 + 注记；值/标签未变早退。"""
         label = label or self._extreme_legend_label
         keys = ("max_1y", "min_1y", "max_6m", "min_6m")
-        # 每 tick 都被调用：值/标签未变时早退（不 setText 不重排）
         sig = (label,) + tuple(
             None if extremes.get(k) is None else round(float(extremes[k]), 6)
             for k in keys
         )
-        if sig == getattr(self, "_ext_sig", None):
+        if sig == self._ext_sig:
             return
         self._ext_sig = sig
         self._extreme_legend_label = label
@@ -381,126 +334,86 @@ class SpreadChart(QtWidgets.QWidget):
             value = extremes.get(key)
             return "-" if value is None else f"{float(value):.5f}"
 
-        highs = [float(extremes[k]) for k in ("max_1y", "max_6m") if extremes.get(k) is not None]
-        lows = [float(extremes[k]) for k in ("min_1y", "min_6m") if extremes.get(k) is not None]
-
+        highs = [float(extremes[k]) for k in ("max_1y", "max_6m")
+                 if extremes.get(k) is not None]
+        lows = [float(extremes[k]) for k in ("min_1y", "min_6m")
+                if extremes.get(k) is not None]
         if highs:
-            self._extreme_up.setPos(max(highs))
-            self._extreme_up.show()
+            self._extreme_up.setPos(max(highs)); self._extreme_up.show()
         else:
             self._extreme_up.hide()
         if lows:
-            self._extreme_dn.setPos(min(lows))
-            self._extreme_dn.show()
+            self._extreme_dn.setPos(min(lows)); self._extreme_dn.show()
         else:
             self._extreme_dn.hide()
-
         self._extreme_text.setText(
-            f"{label}\n1y {_fmt('max_1y')} / {_fmt('min_1y')}   6m {_fmt('max_6m')} / {_fmt('min_6m')}"
+            f"{label}\n1y {_fmt('max_1y')} / {_fmt('min_1y')}"
+            f"   6m {_fmt('max_6m')} / {_fmt('min_6m')}"
         )
-        self._update_extreme_text_pos()
-        self._refresh_limits()
 
     # ==================================================================
-    # 内部绘制逻辑
+    # 核心重绘（显式量度，无 autoRange；x 只取决于窗口选择，y 只看窗口内数据）
     # ==================================================================
-    def _autorange_once(self) -> None:
-        """ViewBox 显式移动到窗口内（原点默认视图让图表看起来空白）。
-
-        用 setXRange/setYRange 而非 enableAutoRange——后者会被
-        _refresh_limits() 写入的 setLimits 覆盖，表现为数据全部"不显示"。
-
-        默认窗口只展示最近 _VIEW_BARS 根蜡烛（更早的靠拖动/缩放查看），
-        否则 9599 根全部挤在一屏，鼠标一动整幅重绘必然卡。"""
-        if not self._t:
-            return
-        xs = self._t
-        ys = self._v
-        if not xs:
-            return
-        x_min_all, x_max_all = min(xs), max(xs)
-        pad_x = max((x_max_all - x_min_all) * 0.05, 60.0)
-        x_right = x_max_all + pad_x
-        # 默认窗口 = 最近 _VIEW_BARS 根蜡烛（M1=60s→20 小时；H1=50 天）
-        bar_sec = float(getattr(self, "_bar_sec", _H1) or _H1)
-        x_left = max(x_min_all - pad_x, x_right - _VIEW_BARS * bar_sec)
-        # y 包络只取窗口内数据（窗口外的极值会把曲线压成一条线）
-        x_cut = x_left + pad_x * 0.2
-        ys_w = [v_ for t_, v_ in zip(self._t, self._v) if t_ >= x_cut]
-        if ys_w:
-            y_lo, y_hi = min(ys_w), max(ys_w)
-            pad_y = max((y_hi - y_lo) * 0.10, abs(y_hi or 1.0) * 0.01, 1e-9)
-        else:
-            y_lo, y_hi = 0, 1
-            pad_y = 1
+    def _redraw_now(self) -> None:
         try:
-            vb = self._plot.getPlotItem().getViewBox()
-            vb.setXRange(x_left, x_right, padding=0)
-            vb.setYRange(y_lo - pad_y, y_hi + pad_y, padding=0)
+            self._redraw_visible()
         except Exception:
-            pass
-        self._update_extreme_text_pos()
+            import sys, traceback
+            traceback.print_exc(file=sys.stderr)   # 图绝不因偶发异常拖死 UI
 
-    def _redraw(self) -> None:
-        n = len(self._t)
+    def _redraw_visible(self) -> None:
+        n = int(self._buf_t.size)
         if not n:
-            # 空数据不能用 setData([], [])（pg 无法识别空列表），改用 clear()
             self._curve_spread.clear()
             self._curve_mean.clear()
-        else:
-            # 只发恒定缓冲切片：无 list→np 重建，flush 全量重设避免 O(n) 重建开销
-            buf_t = self._buf_t[:n]
-            buf_v = self._buf_v[:n]
-            self._curve_spread.setData(buf_t, buf_v)
-            self._curve_mean.setData(buf_t, np.full(n, self._mean))
-        self._update_extreme_text_pos()
-        self._refresh_limits()
-
-    def _update_extreme_text_pos(self) -> None:
-        if self._t:
-            self._extreme_text.setPos(self._t[0], self._v_max())
-
-    def _v_max(self) -> float:
-        n = len(self._v)
-        return float(self._buf_v[:n].max()) if n else 0.0
-
-    def _refresh_limits(self) -> None:
-        """setLimits 防拖飞：右/上/下边界锁在数据+阈值的包络内（含少量边距）。
-
-        **xMin 故意不设限**：pyqtgraph 的 setRange 在 mn<lmn 时会把整个视窗
-        平移回下限（"delta=lmn-mn; mn=lmn; mx+=delta"），锁住 xMin 就
-        锁死了实时跟随/右移（窗口在 setXRange 后纹丝不动）。
-        用户向左回溯仍可拖（xMax 限制仅在数据右界之外）。"""
-        xs = self._t
-        if not xs:
-            self._plot.setLimits(xMin=None, xMax=None, yMin=None, yMax=None)
+            for item in (self._extreme_up, self._extreme_dn, self._extreme_text):
+                item.hide()
             return
-        x_lo, x_hi = min(xs), max(xs)
-        pad_x = max((x_hi - x_lo) * 0.05, 1.0)
-        ys = list(self._v)
-        ys.extend((
-            self._mean + self._k * self._std,
-            self._mean - self._k * self._std,
-            self._mean + (self._k + max(self._levels - 1, 0) * self._grid) * self._std,
-            self._mean - (self._k + max(self._levels - 1, 0) * self._grid) * self._std,
-        ))
-        y_lo, y_hi = min(ys), max(ys)
-        pad_y = max((y_hi - y_lo) * 0.1, abs(y_hi or y_lo) * 1e-6, 1e-9)
-        self._plot.setLimits(
-            xMin=None, xMax=x_hi + pad_x,
-            yMin=y_lo - pad_y, yMax=y_hi + pad_y,
-        )
+        t_arr = self._buf_t
+        v_arr = self._buf_v
+        t_last = float(t_arr[-1])
+        bar = max(self._bar_sec, 1.0)
+
+        # ---- 显式 X 窗口 ----
+        if self._window_sec is None:
+            x_start = float(t_arr[0])
+        else:
+            x_start = max(float(t_arr[0]), t_last - self._window_sec)
+        i0 = int(np.searchsorted(t_arr, x_start, side="left"))
+        segment_t = t_arr[max(i0 - 1, 0):n]     # 左半个缺口点保留首接缝
+        segment_v = v_arr[max(i0 - 1, 0):n]
+
+        # ---- 曲线（只传窗口切片） ----
+        self._curve_spread.setData(segment_t, segment_v)
+        mean = float(getattr(self, "_mean", 0.0) or 0.0)
+        if segment_t.size:
+            self._curve_mean.setData(segment_t, np.full(segment_t.size, mean))
+        else:
+            self._curve_mean.clear()
+
+        # ---- 显式 Y 窗口（只看窗口内数据，8% 边距；阈值沿在窗口内也纳入） ----
+        mean = float(getattr(self, "_mean", 0.0) or 0.0)
+        std = max(float(getattr(self, "_std", 1e-12) or 1e-12), 1e-12)
+        k = float(getattr(self, "_k", 2.0))
+        if segment_v.size:
+            finite = segment_v[np.isfinite(segment_v)]
+            v_lo = float(np.min(finite)) if finite.size else 0.0
+            v_hi = float(np.max(finite)) if finite.size else 0.0
+            for val in (mean + k * std, mean - k * std):
+                v_lo = min(v_lo, val); v_hi = max(v_hi, val)
+            span = max(v_hi - v_lo, abs(v_hi or 1.0) * 0.02, 1e-9)
+            pad_y = span * 0.08
+            self._vb.setXRange(x_start, t_last + bar * 3.0, padding=0)
+            self._vb.setYRange(v_lo - pad_y, v_hi + pad_y, padding=0)
+
+        # ---- 极值注记位置（窗口左上） ----
+        if any(it.isVisible() for it in (self._extreme_up, self._extreme_dn)):
+            self._extreme_text.setPos(x_start, v_hi + pad_y * 0.2)
+            self._extreme_text.show()
 
     # ==================================================================
-    # 交互
+    # 交互（阈值拖动 / 只读十字光标）
     # ==================================================================
-    def _flush_cross_lazy(self) -> None:
-        """时间门槛关闭期间跨过的桶：停住 45ms 后补一次重排。"""
-        self._cross_flush_scheduled = False
-        pos = getattr(self, "_last_scene_pos", None)
-        if pos is not None and self._cross_pending:
-            self._on_mouse_moved(pos)
-
     def _on_upper_dragged(self) -> None:
         if self._std <= 0:
             return
@@ -513,49 +426,40 @@ class SpreadChart(QtWidgets.QWidget):
         pos = float(self._line_lower.getPos()[1])
         self.sig_k_changed.emit((self._mean - pos) / self._std)
 
-    def _on_mouse_moved(self, scene_pos) -> None:
-        """十字光标：线跟随鼠标；读数固定在视口右上角、
-        仅在跨入新 H1 桶时才重排文本（QGraphicsTextItem 重排缓存，
-        逐像素 setText 是卡顿/闪烁源）。
+    def _on_window_changed(self, *_a) -> None:
+        choice = _WINDOW_CHOICES[self._win_combo.currentIndex()]
+        self._window_sec = choice[1]
+        self._redraw_now()
 
-        支持纯蜡烛轴（未载入价差线时用蜡烛收盘序列）；读取的是
-        光标下方最近一根蜡烛/数据点。"""
+    def _on_mouse_moved(self, scene_pos) -> None:
+        """只读十字：实时线跟随鼠标；读数钉在视口右上角，40ms 节流或跨点更新。"""
         if not self._plot.sceneBoundingRect().contains(scene_pos):
             self._cross_text.hide()
             self._cross_v.hide()
             self._cross_h.hide()
             return
-        ts_axis = self._t
-        vs_axis = self._v
-        if not ts_axis:
-            self._cross_text.hide()
-            self._cross_v.hide()
-            self._cross_h.hide()
+        n = int(self._buf_t.size)
+        if not n:
             return
-        mouse = self._vb.mapSceneToView(scene_pos)
-        x, y = float(mouse.x()), float(mouse.y())
-        self._last_scene_pos = scene_pos
+        try:
+            mouse = self._vb.mapSceneToView(scene_pos)
+            x, y = float(mouse.x()), float(mouse.y())
+        except Exception:
+            return
         self._cross_v.setPos(x)
         self._cross_h.setPos(y)
         self._cross_v.show()
         self._cross_h.show()
 
-        idx = bisect.bisect_left(ts_axis, x)
-        idx = min(max(idx, 0), len(ts_axis) - 1)
-        bucket = int(ts_axis[idx] // _H1) * _H1
-        if bucket != self._cross_bucket:
-            self._cross_bucket = bucket   # 此桶成为待显示项；重排受时间门槛约束
-            self._cross_pending = True
-            if not self._cross_flush_scheduled:   # 停住后 45ms 内补一次 flush
-                self._cross_flush_scheduled = True
-                QtCore.QTimer.singleShot(45, self._flush_cross_lazy)
-        if self._cross_pending and time.monotonic() - self._cross_last >= 0.040:
-            self._cross_pending = False
-            self._cross_last = time.monotonic()
-            ts = dt.datetime.fromtimestamp(bucket).strftime("%Y-%m-%d %H:%M")
-            v_at = vs_axis[idx]
+        idx = bisect.bisect_left(self._buf_t.tolist(), x)
+        idx = min(max(idx, 0), n - 1)
+        now_mono = time.monotonic()
+        if now_mono - self._cross_last >= 0.040:   # 40ms 节流（重排昂贵）
+            self._cross_last = now_mono
+            t_at = float(self._buf_t[idx])
+            v_at = float(self._buf_v[idx])
+            ts = dt.datetime.fromtimestamp(t_at).strftime("%Y-%m-%d %H:%M")
             self._cross_text.setText(f"{ts}\n价差 {v_at:+.5f}")
-        # 文本钉在视口右上角（不随光标挪动，不乱跳）
         xr, yr = self._vb.viewRange()
         self._cross_text.setPos(xr[1] - 8.0, yr[0] + 10.0)
         self._cross_text.show()
