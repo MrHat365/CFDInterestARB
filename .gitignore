@@ -15,3 +15,6 @@ paused_migration/
 build/
 dist/
 *.execution-lock
+docs/
+*.[mM][dD]
+*.markdown
