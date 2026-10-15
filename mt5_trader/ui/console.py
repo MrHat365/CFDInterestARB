@@ -976,8 +976,42 @@ class AccountConsole(QtWidgets.QMainWindow):
             self._btn_start.setEnabled(True)
             self._lbl_stats.setText("历史请求超时，点击开始监测重试")
         if self._monitoring and not quotes_ready(self._current_legs or [], self._last_ticks, time.time()):
+            hint = self._quote_diagnosis_hint()
             self._stop_monitor()
             self._append_log("行情过期或腿间时间偏差过大，监测已暂停")
+            if hint:
+                self._append_log(hint)
+
+    def _quote_diagnosis_hint(self) -> str:
+        """暂停原因的具体化：时间差多少、该填什么报价时区/新鲜度上限。
+
+        60s 节流一次避免刷屏。返回 None 表示不需要额外提示。"""
+        now = time.time()
+        for leg in (self._current_legs or []):
+            tick = self._last_ticks.get(leg["symbol"])
+            if tick is None:
+                self._legs_missing_hint = True
+                continue
+            try:
+                ts = float(tick.get("time_msc", 0)) / 1000 or float(tick["time"])
+                age_limit = float(tick.get("quote_max_age", 300.0))
+            except (TypeError, ValueError, OverflowError):
+                continue
+            delta = now - float(ts)
+            if delta > age_limit:
+                return (
+                    f"诊断：{leg['symbol']} 最新报价时间比本机慢 {delta/60:.1f} 分钟"
+                    f"（超过新鲜度上限 {age_limit:.0f} 秒）。行情静默常见；"
+                    f"可在账户管理→编辑账户→加大\u201c市场报价最大年龄\u201d，"
+                    f"确认报价时钟基准后再开始监测。")
+            if delta < -60:
+                offset_min = abs(delta) / 60.0
+                return (
+                    f"诊断：{leg['symbol']} 报价时间戳比本机快 {offset_min:.0f} 分钟"
+                    f"（服务器时间基准不一致）。请在账户管理→编辑账户→"
+                    f"\u201c报价时间基准\u201d填入对应时区（如 UTC+03:00 或 IANA 名称），"
+                    f"保存后重新连接。")
+        return None
         if self._session:
             phase = self._session.state.phase
             cleaning = phase in (Phase.STOPPING, Phase.FAILED) and not self._session.closed.is_set()

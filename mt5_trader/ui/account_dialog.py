@@ -29,7 +29,7 @@ class AccountDialog(QtWidgets.QDialog):
         self._broker_timezone = QtWidgets.QLineEdit((initial or {}).get('broker_timezone', 'UTC'))
         self._broker_timezone.setToolTip('MT5默认UTC；仅在核实API时间偏移后设置UTC+03:00或IANA时区（含历史DST规则）')
         self._quote_age = QtWidgets.QSpinBox()
-        self._quote_age.setRange(5, 120)
+        self._quote_age.setRange(5, 600)
         self._quote_age.setValue(int((initial or {}).get('quote_max_age', 60)))
         self._quote_age.setSuffix(' 秒')
 

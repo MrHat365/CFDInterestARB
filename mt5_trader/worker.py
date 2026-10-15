@@ -105,9 +105,11 @@ class _Worker:
         self._health = WorkerHealth()
         from .broker_clock import BrokerClock
         self._clock = BrokerClock(config.get('broker_timezone', 'UTC'))
+        # 静默市场低流动性腿可 5-10 分钟无新 tick，上限放宽到 600s；
+        # 默认保持 60（与远程作者口径一致），用户在账户对话框按需加大。
         self._quote_max_age = float(config.get('quote_max_age', 60))
-        if not math.isfinite(self._quote_max_age) or not 5 <= self._quote_max_age <= 120:
-            raise ValueError('市场报价最大年龄必须为5至120秒')
+        if not math.isfinite(self._quote_max_age) or not 5 <= self._quote_max_age <= 600:
+            raise ValueError('市场报价最大年龄必须为5至600秒')
 
     # ------------------------------------------------------------------
     # 主循环
