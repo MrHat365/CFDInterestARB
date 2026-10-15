@@ -727,7 +727,7 @@ class AccountConsole(QtWidgets.QMainWindow):
         self._conn_state = "waiting"
         self._opp_thread = False        # 机会计算线程在跑（防重入）
         self._auto_load_pending = False  # 自动载入首个组合挂起（后台计算完成后消费）
-        self._last_hist_req = 0.0       # 上次历史价差请求时间（60s 节流）
+        self._hist_req_by_sig: dict[tuple, float] = {}   # 组合签名 -> 上次历史请求时间（按组合分别 60s 节流）
 
         # 后台线程 -> 主线程回调桥（机会计算结果投递等）
         self._callin = _CallInMain(self)
@@ -1343,6 +1343,12 @@ class AccountConsole(QtWidgets.QMainWindow):
             )
             return
         if self._auto_load_pending:
+            # 用户已手动载入（含 ready 回调前的窗口）则不覆盖：
+            # 覆盖顺序问题——用户的主动选择永远优先于 auto-load
+            if self._current_legs:
+                self._auto_load_pending = False
+                self._append_log("后台机会计算完成，跳过自动载入（用户已手动选组合）")
+                return
             self._auto_load_pending = False
             if self._opportunities:
                 self._append_log("已自动载入最优组合（可在【交易机会】页另选）")
@@ -1470,6 +1476,16 @@ class AccountConsole(QtWidgets.QMainWindow):
             for leg in (self._current_legs or [])
         ]
 
+    @staticmethod
+    def _legs_signature(legs: list[dict] | None) -> tuple:
+        """组合签名（symbol/side/weight 四位小数）：用于历史载荷归属校验与
+        分组合节流——历史事件必须与当前载入的组合严格一致才画上。"""
+        return tuple(
+            (str(leg.get("symbol", "")), str(leg.get("side", "buy")),
+             round(float(leg.get("weight", 1.0)), 4))
+            for leg in (legs or [])
+        )
+
     def _ensure_runner(self) -> bool:
         if not self._current_legs:
             QtWidgets.QMessageBox.warning(
@@ -1547,18 +1563,32 @@ class AccountConsole(QtWidgets.QMainWindow):
         self._request_spread_history_guarded()
 
     def _request_spread_history_guarded(self) -> None:
-        """历史价差请求 60s 节流：窗口内已发过则跳过，避免重复拉取刷屏/压 worker。"""
+        """历史价差请求节流：**按组合签名**分别 60s 节流——
+
+        同一组合 60s 内已发过则跳过；切换到新组合立即放行（否则用户
+        载入新组合时命中上一组合的窗口会跳过需拉的请求，图上
+        长时间滞留旧组合的价差——载入组合**: 先拉新历史**）。"""
+        sig = self._legs_signature(self._cleaned_legs())
+        last = self._hist_req_by_sig.get(sig, 0.0)
         now = time.time()
-        if now - self._last_hist_req < 60.0:
-            self._append_log("历史价差 60 秒内已请求过，本次跳过")
+        if now - last < 60.0:
+            self._append_log("同一组合 60 秒内已请求过历史，本次跳过")
             return
-        self._last_hist_req = now
+        self._hist_req_by_sig[sig] = now
         self._sess_repeat(lambda s: s.request_spread_history(self._cleaned_legs()))
 
     def _on_spread_history(self, event) -> None:
         if not self._is_self(event) or self._runner is None:
             return
         payload = event.data["payload"]
+        # 载荷归属校验：事件里的 legs 必须与当前组合一致（worker 后台
+        # latest-wins 拉取，旧组合的历史可能晚到）——不匹配丢弃。
+        sig_in = self._legs_signature(payload.get("legs"))
+        if sig_in != self._legs_signature(self._current_legs or []):
+            self._append_log(
+                "已收到过期组合的历史价差（与当前载入组合不一致），已丢弃"
+            )
+            return
         datasets = payload.get("datasets", {})
         # 统计先验/长窗极值：H1 全窗（≥1 年）；图表与实时：M1 折线
         nh1 = len(datasets.get("h1", {}).get("v", []))

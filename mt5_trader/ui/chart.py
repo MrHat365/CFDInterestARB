@@ -239,7 +239,7 @@ class SpreadChart(QtWidgets.QWidget):
         self._buf_v = np.empty(new_cap, dtype=float)
 
     def append_point(self, t: float, v: float) -> None:
-        """live 增点（追加）；setData 限频 200ms，避免每 tick 全量重建曲线。"""
+        """live 增点（追加）；setData 限频 200ms + 视图自动跟随右缘（可拖动打断）。"""
         t_f = float(t)
         v_f = float(v)
         self._t.append(t_f)
@@ -248,9 +248,30 @@ class SpreadChart(QtWidgets.QWidget):
         self._buf_ensure(n)
         self._buf_t[n - 1] = t_f
         self._buf_v[n - 1] = v_f
+        self._follow_right_edge(t_f)
         self._curve_dirty = True
         if not self._curve_flush.isActive():
             self._curve_flush.start(200)
+
+    def _follow_right_edge(self, t_latest: float) -> None:
+        """视图跟随：仅当用户当前正看着最右端（右缘差 latest ≤ 2 个桶宽）
+        时才把窗口平移到最新点；手动拖/缩放到老时段则不跟随（不打断浏览）。
+
+        setXRange 前先刷新 limits（xMax 追最新数据+pad），避免请求的右缘
+        被 pyqtgraph 的 mn<lmn 平移回弹（_window 平移的坑已定位：limits
+        下限锁在旧 x_lo - pad_x 时任何右移都会被弹回起点，左界用 None 已解）。"""
+        try:
+            xr, _yr = self._vb.viewRange()
+            right = xr[1]
+            bar = max(self._bar_sec, 1.0)
+            if t_latest - right <= bar * 2.0:   # 用户在看最新段 → 平移
+                self._refresh_limits()          # 同步 xMax 至最新数据包络
+                span = right - xr[0]
+                lead = bar * 5.0                # 右缘留 5 个桶宽空白
+                self._vb.setXRange(t_latest + lead - span, t_latest + lead,
+                                   padding=0)
+        except Exception:
+            pass
 
     def _flush_curve(self) -> None:
         if self._curve_dirty:
@@ -444,7 +465,12 @@ class SpreadChart(QtWidgets.QWidget):
         return float(self._buf_v[:n].max()) if n else 0.0
 
     def _refresh_limits(self) -> None:
-        """setLimits 防拖飞：把视图边界锁在数据+阈值+蜡烛的包络内（含少量边距）。"""
+        """setLimits 防拖飞：右/上/下边界锁在数据+阈值的包络内（含少量边距）。
+
+        **xMin 故意不设限**：pyqtgraph 的 setRange 在 mn<lmn 时会把整个视窗
+        平移回下限（"delta=lmn-mn; mn=lmn; mx+=delta"），锁住 xMin 就
+        锁死了实时跟随/右移（窗口在 setXRange 后纹丝不动）。
+        用户向左回溯仍可拖（xMax 限制仅在数据右界之外）。"""
         xs = self._t
         if not xs:
             self._plot.setLimits(xMin=None, xMax=None, yMin=None, yMax=None)
@@ -461,7 +487,7 @@ class SpreadChart(QtWidgets.QWidget):
         y_lo, y_hi = min(ys), max(ys)
         pad_y = max((y_hi - y_lo) * 0.1, abs(y_hi or y_lo) * 1e-6, 1e-9)
         self._plot.setLimits(
-            xMin=x_lo - pad_x, xMax=x_hi + pad_x,
+            xMin=None, xMax=x_hi + pad_x,
             yMin=y_lo - pad_y, yMax=y_hi + pad_y,
         )
 
