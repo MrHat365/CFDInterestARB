@@ -7,3 +7,5 @@ __pycache__/
 mt5_trader/mt5_trader.db
 *.log
 .DS_Store
+mt5_trader/mt5_trader.db-shm
+mt5_trader/mt5_trader.db-wal
