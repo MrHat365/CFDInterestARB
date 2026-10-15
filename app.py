@@ -7,6 +7,7 @@ SQLite 负责账户/终端绑定/swap 快照/策略记录/价差缓存持久化�
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 
 from PySide6 import QtWidgets
 
@@ -37,7 +38,10 @@ def main() -> None:
 
     # 3. 主窗口（账户管理）
     store = AccountsStore(db)
-    sessions = SessionRegistry(event_engine, str(db.path.resolve()))
+    # 受管执行账本独立文件：与主库分离（账本含执行独占锁，混用会造成
+    # [Errno 13] Permission denied/锁竞争，worker 子进程无法打开账本）
+    exec_db = Path(db.path).parent / "execution.db"
+    sessions = SessionRegistry(event_engine, str(exec_db))
     try:
         window = MainWindow(event_engine, store, db, sessions)
         window.show()

@@ -21,3 +21,6 @@ docs/
 !/README.md
 /CFDInterestARB.spec
 /requirements-build.txt
+
+mt5_trader/execution.db
+*.execution-lock
