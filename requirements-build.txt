@@ -1,3 +1,0 @@
--r requirements-dev.txt
-pyinstaller>=6.0
-pip-licenses>=5.0

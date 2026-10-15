@@ -1,5 +1,4 @@
-name: Quality and Windows package
-# Explicit launch only: this workflow has not been run during the static audit.
+name: Quality
 on:
   workflow_dispatch:
 permissions:
@@ -21,23 +20,3 @@ jobs:
       - run: python -m mypy app.py mt5_trader
       - run: python -m pytest tests --ignore=tests/test_chart_ui.py -q
       - run: python -m pytest tests/test_chart_ui.py -q
-  windows-package:
-    runs-on: windows-latest
-    env:
-      QT_QPA_PLATFORM: offscreen
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-          cache: pip
-      - run: python -m pip install -r requirements-build.txt
-      - run: python -m pytest tests -q
-      - run: python -m PyInstaller --noconfirm CFDInterestARB.spec
-      - run: python -m pip freeze > dependencies-windows.txt
-      - uses: actions/upload-artifact@v4
-        with:
-          name: windows-candidate-python312
-          path: |
-            dist/CFDInterestARB/
-            dependencies-windows.txt
